@@ -1,0 +1,1204 @@
+---
+title: "eClip_analysis"
+author: "Giorgia Bucciarelli"
+date: "2023-09-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, root.dir = "~/Desktop/Github_repo/YBX1_cSCC_code/data/eCLIP_data/")
+```
+
+```{r, warning=F, message=F, echo=FALSE}
+library(tidyverse)
+library(data.table)
+library(ggrepel) #extra geoms for ggplot2
+library(ggbeeswarm) #to create categorical scatter plots (violin plots)
+library(ggthemes) #extra themes, scales and geoms for ggplot2
+library(ggseqlogo)
+library(factoextra)
+
+library(cliProfiler)
+library(GenomicRanges) # to deal with genomic intervals (BED files)
+library(BSgenome) # genome functions
+library(BSgenome.Hsapiens.UCSC.hg38) # human genome
+library(Biostrings) # deals with sequences (e.g. fasta files), alphabetfrequency
+library(umap)
+library(edgeR) #to perform normalization
+library(ggbreak)
+library(hrbrthemes)
+library(enrichR)
+#library(memes) # to perform motif discovery
+
+library(wesanderson)
+library(extrafont)
+loadfonts(quiet = T)
+bs <- 11
+bf <- "Arial"
+```
+
+```{r}
+ACGU_color <- c("#0f9648","#255c99","#f7b32b","#d62839")
+```
+
+# eClip analysis
+
+```{r resume_bedcoverage, warning=F,message=F,echo=F, eval=T}
+
+#function to read the bed files
+
+resume_bedcoverage<-function(dir, # directory with the bed files
+                             name_cols=c(1,2,3,6), # numeric or vector: columns with feature names, coordinate dei picchi
+                             cov_col=7   # numeric: column with coverage values
+) {
+   
+   list_input<-fs::dir_ls(dir,glob="*.bed",type="file") #
+   
+   if(exists("o_tab")){
+      rm(o_tab)
+   }
+   
+   for(i in (list_input)){
+      
+      i_tab<-read_tsv(i,col_names=F, progress = F,show_col_types = F)
+      
+      s_name<-str_split(i,dir,simplify=T)[,2] 
+      s_name<-str_split(s_name,"\\.",simplify=T)[,1]
+      
+      x_tab <- i_tab %>% unite(id_name,all_of(name_cols)) %>% dplyr::select(id_name)
+      x_tab[,s_name] <- i_tab[,cov_col]
+      
+      rm(i_tab)
+      
+      if(!exists("o_tab")){
+         o_tab<- x_tab
+      } else {
+         o_tab<- full_join(o_tab,x_tab,by="id_name")
+      }
+   }
+   return(o_tab)
+}
+
+```
+
+## Bed files loading 
+
+```{r load BED files}
+same_cov <- resume_bedcoverage(dir = "./data/eCLIP_data/same/", 
+                               name_cols = c(1,2,3,6),
+                               cov_col = 7)
+
+```
+
+```{r merge peaks, warning=F, message=F, echo=F, eval=FALSE}
+# dataframe of number of peaks in each chr region for each sample
+## chr regions on rows, samples on columns
+
+counts_raw_df <- as.data.frame(same_cov)
+rownames(counts_raw_df) <- counts_raw_df$id_name
+counts_raw_df$id_name <- NULL
+
+colnames(counts_raw_df) <- str_sub(colnames(counts_raw_df), 1, -15) 
+
+```
+
+```{r c_anno, warning=F, message=F, echo=F, eval=FALSE}
+
+c_anno <- data.frame("sample" = colnames(counts_raw_df))
+rownames(c_anno) <- c_anno$sample
+
+c_anno_add <- as.data.frame(str_split(string = c_anno$sample, pattern = "_", simplify = T))
+colnames(c_anno_add) <- c("library", "cell", "replicate")
+
+c_anno <- cbind(c_anno, c_anno_add) #column bind the two dfs
+c_anno$condition <- paste(c_anno$library, c_anno$cell, sep = "_")
+c_anno$condition <- factor(c_anno$condition)
+
+counts_raw_df <- counts_raw_df[,c_anno$sample]
+
+rm(c_anno_add)
+```
+
+
+```{r filter_dt}
+counts_raw_dt <- as.data.table(counts_raw_df)
+counts_raw_dt$id <- rownames(counts_raw_df)
+
+c_anno_dt <- as.data.table(c_anno)
+
+sig_thr <- 10 #count threshold
+
+counts_long_dt <- counts_raw_dt[,id:=as.factor(id)]
+counts_long_dt <- melt.data.table(counts_long_dt, id.vars = c("id"), variable.name = "sample", value.name = "counts")#wide to long reshaping tool, similar to pivot_longer?
+
+setkey(counts_long_dt, sample) #sorts a data.table and marks it as sorted, the sorted columns are the key, always in ascending order
+setkey(c_anno_dt, sample)
+
+counts_long_dt <- counts_long_dt[c_anno_dt, on = "sample"]
+
+counts_filter_dt <- counts_long_dt[,.(min_c = min(counts)), .(id, condition)][condition %in% c("IP_SCC", "IP_HK")]
+counts_filter_dt <- counts_filter_dt[,.(passes_c = sum(min_c >= sig_thr)), .(id)] 
+filter_id <- as.character(counts_filter_dt[passes_c > 0]$id)
+
+counts_df <- counts_raw_df[filter_id,]
+# filter to retain regions with a count greater than 10
+
+```
+
+```{r}
+rm(counts_long_dt,
+   counts_filter_dt, 
+   counts_raw_dt, 
+   c_anno_dt)
+```
+
+## Peak Annotation
+
+```{r}
+#load("Results/filtered_modification_df.RData")
+load("./data/ens_anno_110_hs.RData")
+
+# creating exon and gene annotation
+ense_slim <- ense |> dplyr::select(ensembl_exon_id,
+                                   rank, 
+                                   exon_chrom_start,
+                                   '5_utr_start',
+                                   "5_utr_end",
+                                   genomic_coding_start,
+                                   genomic_coding_end,
+                                   "3_utr_start",
+                                   "3_utr_end",
+                                   exon_chrom_end,
+                                   l_exon,
+                                   l_5utr,
+                                   l_3utr,
+                                   l_cds,
+                                   TIS, TTS, exon_class,
+                                   ensembl_transcript_id) 
+
+
+# transcript annotation
+enst_slim <- enst |> dplyr::select(external_transcript_name,
+                                   transcript_biotype, transcript_length,
+                                   canonical, ensembl_transcript_id, ensembl_gene_id)
+
+## We filter to retain only protein coding transcripts for protein coding genes
+# to avoid annotation override based on other biotypes
+enst_filt <- enst_slim |> 
+  group_by(ensembl_gene_id, transcript_biotype) |> 
+  summarise(N = n(), transcripts = paste(external_transcript_name, collapse = " "))
+enst_filt$coding <- ifelse(enst_filt$transcript_biotype == "protein_coding", T, F)
+
+coding_ense <- enst_filt |> filter(coding == T) |> pull(ensembl_gene_id) |> unique()
+enst_filt_n_cod <- enst_filt |> dplyr::filter(ensembl_gene_id %in% coding_ense & transcript_biotype != "protein_coding")
+excluded_t <- unlist(strsplit(enst_filt_n_cod$transcripts, " "))
+
+enst_slim_cod <- enst_slim |> dplyr::filter(!external_transcript_name %in% excluded_t)
+ense_slim_cod <- ense_slim |> dplyr::filter(ensembl_transcript_id %in% enst_slim_cod$ensembl_transcript_id) 
+
+rownames(enst_slim) <- enst_slim$ensembl_transcript_id
+enst_slim <- enst_slim[ense_slim$ensembl_transcript_id,]
+enst_slim$ensembl_transcript_id <- NULL
+
+# gene annotation
+ensg_slim <- ensg |> dplyr::select(external_gene_name, ensembl_gene_id, gene_biotype, chr_ucsc, strand_ucsc)
+rownames(ensg_slim) <- ensg_slim$ensembl_gene_id
+ensg_slim <- ensg_slim[enst_slim$ensembl_gene_id,]
+ensg_slim$ensembl_gene_id <- NULL
+
+# single annotation 
+ense_df <- left_join(enst_slim_cod, ensg, by = "ensembl_gene_id")
+ense_df <- left_join(ense_df, ense_slim_cod, by = "ensembl_transcript_id")
+
+#ense_df <- cbind(ense_slim_cod, ensg_slim) #combines all the annotation dataframes into one
+# in rownames we have the gene names
+#rownames(ense_df)<-make.unique(str_c(ense_df$external_transcript_name, ense_df$rank, sep="_")) #combines external transcript name and rank with "_"
+
+
+# the following function takes a dataframe-like object as input and tries to automatically find the columns that describe genomic ranges
+# returns a GRanges object
+ense_granges <- makeGRangesFromDataFrame(ense_df,
+                                         keep.extra.columns = T, 
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr_ucsc", 
+                                         start.field = "exon_chrom_start",  
+                                         end.field = "exon_chrom_end", 
+                                         strand.field = "strand_ucsc",
+                                         starts.in.df.are.0based = F)
+
+ensg_df <- ensg |> dplyr::select(external_gene_name, ensembl_gene_id, gene_biotype, chr_ucsc, strand_ucsc, start_position, end_position, description)
+
+ensg_granges <- makeGRangesFromDataFrame(ensg_df,
+                                         keep.extra.columns = T, 
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr_ucsc", 
+                                         start.field = "start_position",  
+                                         end.field = "end_position", 
+                                         strand.field = "strand_ucsc",
+                                         starts.in.df.are.0based = F)
+
+```
+
+```{r}
+## 5' UTR granges
+ense_5_utr_granges <- makeGRangesFromDataFrame(ense_df |> dplyr::filter(!is.na(l_5utr)),
+                                               keep.extra.columns = T,
+                                               ignore.strand = F,
+                                               seqinfo = NULL,
+                                               seqnames.field = "chr_ucsc",
+                                               start.field = "5_utr_start",
+                                               end.field = "5_utr_end",
+                                               strand.field = "strand_ucsc",
+                                               starts.in.df.are.0based = F)
+
+
+
+## CDS granges
+ense_cds_granges <- makeGRangesFromDataFrame(ense_df |> dplyr::filter(!is.na(l_cds)),
+                                               keep.extra.columns = T,
+                                               ignore.strand = F,
+                                               seqinfo = NULL,
+                                               seqnames.field = "chr_ucsc",
+                                               start.field = "genomic_coding_start",
+                                               end.field = "genomic_coding_end",
+                                               strand.field = "strand_ucsc",
+                                               starts.in.df.are.0based = F)
+
+## 3' UTR granges
+ense_3_utr_granges <- makeGRangesFromDataFrame(ense_df |> dplyr::filter(!is.na(l_3utr)),
+                                               keep.extra.columns = T,
+                                               ignore.strand = F,
+                                               seqinfo = NULL,
+                                               seqnames.field = "chr_ucsc",
+                                               start.field = "3_utr_start",
+                                               end.field = "3_utr_end",
+                                               strand.field = "strand_ucsc",
+                                               starts.in.df.are.0based = F)
+
+```
+
+
+```{r}
+r_anno <- data.frame("id_name" = rownames(counts_df))
+r_anno_add <- as.data.frame(str_split(string = r_anno$id_name, pattern = "_", simplify = T))
+colnames(r_anno_add) <- c("chr", "start", "end", "strand")
+
+r_anno <- cbind(r_anno, r_anno_add)
+r_anno$start <- as.numeric(r_anno$start)
+r_anno$end <- as.numeric(r_anno$end)
+r_anno$length <- r_anno$end - r_anno$start
+
+chr_conversion_canonical <- data.frame(
+   "chr_ens"=c("1","2","3","4","5","6","7","8","9","10",
+      "11","12","13","14","15","16","17","18","19","20",
+      "21","22","X","Y","MT"),
+   "chr_ucsc"=c("chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9","chr10",
+      "chr11","chr12","chr13","chr14","chr15","chr16","chr17","chr18","chr19","chr20",
+      "chr21","chr22","chrX","chrY","chrM"))
+
+r_anno <- r_anno |> dplyr::filter(chr %in% chr_conversion_canonical$chr_ucsc) #keep only the canonical chromosomes
+
+# check for peak width
+peak_granges <- makeGRangesFromDataFrame(r_anno,
+                                         keep.extra.columns = F,
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr",
+                                         start.field = "start",
+                                         end.field = "end",
+                                         strand.field = "strand",
+                                         starts.in.df.are.0based = T)
+
+r_anno$peak_seq <- getSeq(BSgenome.Hsapiens.UCSC.hg38, peak_granges) |> as.character() |> stringr::str_replace_all("T", "U")
+
+r_anno <- r_anno[!(str_detect(r_anno$peak_seq, "N")),] #remove sequences with N
+
+peak_granges <- makeGRangesFromDataFrame(r_anno,
+                                         keep.extra.columns = T,
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr",
+                                         start.field = "start",
+                                         end.field = "end",
+                                         strand.field = "strand",
+                                         starts.in.df.are.0based = T)
+
+counts_df <- counts_df[r_anno$id_name,]
+```
+
+```{r}
+## Annotation on genes to find intergenic regions and distinguish them from those spanning genes
+
+over_genes<- GenomicRanges::findOverlaps(peak_granges, ensg_granges) #this function returns the overlap (n.rows) between peaks and genes
+
+### Additional ----
+## indentifica le regioni di sovrapposizione
+genes_overlaps_ranges <- pintersect(peak_granges[queryHits(over_genes)], ensg_granges[subjectHits(over_genes)])
+
+## calcola la larghezza delle sovrapposizioni
+#genes_overlap_widths <- width(genes_overlaps_ranges)
+
+
+peak_2_ensg <- peak_granges[queryHits(over_genes)] %>% as_tibble() %>% 
+  dplyr::select(-width)
+ensg_2_peak<- ensg_granges[subjectHits(over_genes)] %>% as_tibble() %>%
+  dplyr::rename(gene_chrom_start=start,
+                gene_chrom_end=end,
+                gene_width=width) %>% 
+  dplyr::select(-seqnames,-strand)
+
+peak_ensg_df <-bind_cols(peak_2_ensg,ensg_2_peak) 
+#mod_ensg_df$overlap_width <- genes_overlap_widths
+#peak_ensg_df <- peak_ensg_df %>% dplyr::filter(!(id_name %in% peak_ense_add$id_name))
+
+peak_ensg_df$region_class <- "Intron"
+peak_ensg_df$gene_biotype<-factor(peak_ensg_df$gene_biotype)
+peak_ensg_df$gene_biotype<-relevel(peak_ensg_df$gene_biotype, ref = "protein_coding")
+
+peak_ensg_dt<- as.data.table(peak_ensg_df)
+setkey(peak_ensg_dt,gene_biotype,gene_width,external_gene_name)
+peak_ensg_dt<-peak_ensg_dt[order(gene_biotype,gene_width,external_gene_name)]
+peak_ensg_unique <- peak_ensg_dt[!duplicated(id_name)]
+```
+
+```{r}
+r_anno <- left_join(r_anno, peak_ensg_unique |> dplyr::select(id_name, external_gene_name))
+
+r_anno$region_class <- "Intergenic"
+r_anno$region_class[which(r_anno$id_name %in% peak_ensg_unique$id_name)] <- "Intron"
+```
+
+```{r}
+rm(over_genes,genes_overlaps_ranges,peak_2_ensg,ensg_2_peak, peak_ensg_df, peak_ensg_dt)
+```
+
+
+```{r}
+## Annotation of peaks over exonic regions (still no details about 5', CDS, 3')
+over_exons <- GenomicRanges::findOverlaps(peak_granges, ense_granges)
+
+## indentifica le regioni di sovrapposizione
+exons_overlaps_ranges <- pintersect(peak_granges[queryHits(over_exons)], ense_granges[subjectHits(over_exons)])
+
+## calcola la larghezza delle sovrapposizioni
+#exons_overlap_widths <- width(exons_overlaps_ranges)
+
+peak_2_ense <- peak_granges[queryHits(over_exons)] %>% as_tibble() %>% 
+  dplyr::select(-width)
+ense_2_peak<- ense_granges[subjectHits(over_exons)] %>% as_tibble() %>%
+  dplyr::rename(exon_chrom_start=start,
+                exon_chrom_end=end,
+                exon_width=width) %>% 
+  dplyr::select(-seqnames,-strand)
+
+peak_ense_df <-bind_cols(peak_2_ense,ense_2_peak) 
+#mod_ense_df$overlap_width <- exons_overlap_widths
+#peak_ensg_df <- peak_ensg_df %>% dplyr::filter(!(id_name %in% peak_ense_add$id_name))
+
+peak_ense_df$region_class <- "Non-coding Exon"
+peak_ense_df$gene_biotype<-factor(peak_ense_df$gene_biotype)
+peak_ense_df$gene_biotype<-relevel(peak_ense_df$gene_biotype, ref = "protein_coding")
+
+peak_ense_dt<- as.data.table(peak_ense_df)
+setkey(peak_ense_dt,gene_biotype,exon_width,external_gene_name)
+peak_ense_dt<-peak_ense_dt[order(gene_biotype,exon_width,external_gene_name)]
+peak_ense_unique <- peak_ense_dt[!duplicated(id_name)]
+
+r_anno$region_class[which(r_anno$id_name %in% peak_ense_unique$id_name)] <- "Non-coding Exon"
+
+## Add annotations of the exons 
+# peak_anno <- peak_ensg_unique
+# peak_anno$region_class[which(peak_ensg_unique$id_name %in% peak_ense_unique$id_name)] <- peak_ense_unique$region_class
+# 
+peak_anno_ense_eng <- full_join(peak_ense_unique, peak_ensg_unique)
+peak_anno_ense_ensg_dt<- as.data.table(peak_anno_ense_eng)
+setkey(peak_anno_ense_ensg_dt,gene_biotype,exon_width,external_gene_name)
+peak_anno_ense_ensg_dt<- peak_anno_ense_ensg_dt[order(gene_biotype,exon_width,external_gene_name)]
+peak_anno_ense_ensg_unique <- peak_anno_ense_ensg_dt[!duplicated(id_name)]
+```
+
+```{r}
+rm(over_exons,exons_overlaps_ranges,peak_2_ense,ense_2_peak,peak_ense_df,peak_ense_dt,peak_anno_ense_eng,peak_anno_ense_ensg_dt)
+```
+
+```{r over 5'utr}
+over_5_utr <- GenomicRanges::findOverlaps(peak_granges, ense_5_utr_granges) ## overlap between peaks and 5'UTR
+
+overlap_ranges_5utr <- pintersect(peak_granges[queryHits(over_5_utr)], ense_5_utr_granges[subjectHits(over_5_utr)])
+#overlap_widths_5utr <- width(overlap_ranges_5utr)
+
+peak_2_5utr <- peak_granges[queryHits(over_5_utr)] |> as.tibble() #|> dplyr::rename(_width = width)
+ense_5utr_2_peak <- ense_5_utr_granges[subjectHits(over_5_utr)] |> as.tibble() |> dplyr::select(-width, -seqnames, -strand) |> dplyr::rename(start_5_utr = start, end_5_utr = end)
+
+peak_5utr_df <- bind_cols(peak_2_5utr, ense_5utr_2_peak)
+#mod_base_5utr_df$overlap_width <- overlap_widths_5utr
+peak_5utr_df$region_class <- "5_UTR"
+
+peak_5utr_dt<- as.data.table(peak_5utr_df)
+setkey(peak_5utr_dt, canonical, region_class, external_transcript_name, rank)
+peak_5utr_dt<-peak_5utr_dt[order(canonical,exon_class,external_transcript_name,rank)]
+peak_5utr_unique <- peak_5utr_dt[!duplicated(id_name)]
+
+r_anno$region_class[which(r_anno$id %in% peak_5utr_unique$id_name)] <- "5_UTR"
+```
+
+```{r}
+rm(over_5_utr, overlap_ranges_5utr, peak_2_5utr, ense_5utr_2_peak, peak_5utr_df,peak_5utr_dt)
+```
+
+```{r}
+over_cds <- GenomicRanges::findOverlaps(peak_granges, ense_cds_granges) ## overlap between peaks and 5'UTR
+
+overlap_ranges_cds <- pintersect(peak_granges[queryHits(over_cds)], ense_cds_granges[subjectHits(over_cds)])
+#overlap_widths_5utr <- width(overlap_ranges_5utr)
+
+peak_2_cds <- peak_granges[queryHits(over_cds)] |> as.tibble() #|> dplyr::rename(_width = width)
+ense_cds_2_peak <- ense_cds_granges[subjectHits(over_cds)] |> as.tibble() |> dplyr::select(-width, -seqnames, -strand) |> dplyr::rename(start_cds = start, end_cds = end)
+
+peak_cds_df <- bind_cols(peak_2_cds, ense_cds_2_peak)
+#peak_5utr_df$overlap_width <- overlap_widths_5utr
+peak_cds_df$region_class <- "CDS"
+
+peak_cds_dt<- as.data.table(peak_cds_df)
+setkey(peak_cds_dt, canonical, region_class, external_transcript_name, rank)
+peak_cds_dt<-peak_cds_dt[order(canonical,exon_class,external_transcript_name,rank)]
+peak_cds_unique <- peak_cds_dt[!duplicated(id_name)]
+
+r_anno$region_class[which(r_anno$id_name %in% peak_cds_unique$id_name)] <- "CDS"
+```
+
+```{r}
+rm(over_cds, overlap_ranges_cds, peak_2_cds,ense_cds_2_peak,peak_cds_df,peak_cds_dt)
+```
+
+```{r over 3'utr}
+over_3_utr <- GenomicRanges::findOverlaps(peak_granges, ense_3_utr_granges) ## overlap between peaks and 5'UTR
+
+overlap_ranges_3utr <- pintersect(peak_granges[queryHits(over_3_utr)], ense_3_utr_granges[subjectHits(over_3_utr)])
+#overlap_widths_5utr <- width(overlap_ranges_5utr)
+
+peak_2_3utr <- peak_granges[queryHits(over_3_utr)] |> as.tibble() #|> dplyr::rename(_width = width)
+ense_3utr_2_peak <- ense_3_utr_granges[subjectHits(over_3_utr)] |> as.tibble() |> dplyr::select(-width, -seqnames, -strand) |> dplyr::rename(start_3_utr = start, end_3_utr = end)
+
+peak_3utr_df <- bind_cols(peak_2_3utr, ense_3utr_2_peak)
+#peak_5utr_df$overlap_width <- overlap_widths_5utr
+peak_3utr_df$region_class <- "3_UTR"
+
+peak_3utr_dt<- as.data.table(peak_3utr_df)
+setkey(peak_3utr_dt, canonical, region_class, external_transcript_name, rank)
+peak_3utr_dt<-peak_3utr_dt[order(canonical,exon_class,external_transcript_name,rank)]
+peak_3utr_unique <- peak_3utr_dt[!duplicated(id_name)]
+
+r_anno$region_class[which(r_anno$id_name %in% peak_3utr_unique$id_name)] <- "3_UTR"
+```
+
+```{r}
+rm(over_3_utr, overlap_ranges_3utr, peak_2_3utr,ense_3utr_2_peak,peak_3utr_df,peak_3utr_dt)
+```
+
+## Raw counts clustering before normalization (MDS plot)
+
+```{r}
+
+sample_data <- scale(t(counts_df)) ## matrix with samples on rows and regions on columns
+sample_distances <- dist(sample_data, method = "euclidean") ## computes and return the distance matrix, with the distances between the rows of a data matrix
+
+mds_cmdscale <- as.data.frame(cmdscale(as.matrix(sample_distances)))
+colnames(mds_cmdscale) <- c("MDS_1", "MDS_2")
+mds_cmdscale$sample <- rownames(mds_cmdscale)
+
+mds_cmdscale <- left_join(mds_cmdscale, c_anno)
+
+bs <- 11
+bf <- "Arial"
+
+cmd <- ggplot(mds_cmdscale, aes(MDS_1, MDS_2, colour = condition, shape = library)) + #mds plot
+  geom_point(size = 2.5, alpha = .9) +
+  geom_text_repel(aes(label = paste(library, cell, replicate, sep = "_")), size = 0.3*bs, fontface = "bold", show.legend = F) +
+  theme_bw(base_size = bs, base_family = bf) + 
+  theme(legend.position = "right", panel.grid.minor = element_blank()) +
+  scale_color_manual(values = c("#5b5b5b","#bf9000","#0b5394","#cc0000"))
+
+cmd
+```
+
+## Number of reads for each sample
+
+```{r}
+
+bar_df <- data.frame("sample" = colnames(counts_df), "count" =(colSums(counts_df)/1000000))
+bar_df <- left_join(bar_df, c_anno)
+
+bp <- ggplot(bar_df, aes(sample, count, fill = condition)) +
+  geom_bar(stat="identity", width = 0.7) +
+  coord_flip() +
+  theme_bw(base_size = bs, base_family = bf) +
+  theme(axis.title.y = element_blank(), panel.border = element_blank(), axis.text.y = element_text(size = 8, colour = "black")) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank()) +
+  theme(legend.position = "na")+
+  labs(y = "aligned reads (mln)") +
+  scale_fill_manual(values =c("#5b5b5b","#bf9000","#0b5394","#cc0000"))
+  
+bp  
+```
+
+## TMM Normalization
+
+```{r edgeR, eval=FALSE}
+edge_c <- DGEList(counts = counts_df, group = c_anno$condition, samples = c_anno, genes = r_anno) #create DGE object
+edge_n <- calcNormFactors(edge_c, method = "TMM") #compute normalization factors with TMM method
+
+norm_factors <- (edge_n$samples$lib.size*edge_n$samples$norm.factors)/mean(edge_n$samples$lib.size*edge_n$samples$norm.factors)
+#librarysize*normfactor / mean(librarysize*normfactor)
+names(norm_factors) <- edge_n$samples$sample
+
+norm_df <- data.frame("sample" = names(norm_factors),
+                      "div_norm" = norm_factors)
+
+```
+
+
+## FPKM
+
+```{r fpkm_tables, messag = F, warning=F, echo=F, eval=F}
+#fragments per kilobase  million = rpkm function
+fpkm_table <- as.data.frame(rpkm(edge_n, gene.length = edge_n$genes$length, log = F))
+
+
+# l_fpkm_table <- fpkm_table |> 
+#                 mutate(id = rownames(fpkm_table)) |>
+#                 pivot_longer(-id, names_to = "sample", values_to = "fpkm")
+# l_fpkm_table <- left_join(l_fpkm_table, c_anno)
+# 
+# fpkm_df <- l_fpkm_table |>
+#            dplyr::group_by(condition, id) |>
+#            dplyr::summarise(N = n(), avg = mean(fpkm), sd = sd(fpkm)) |> 
+#            ungroup() |>
+#            mutate("se" = sd/sqrt(N))
+# 
+# fpkm_avg <- fpkm_df %>% dplyr::select(id,condition,avg) %>% pivot_wider(names_from = condition, values_from = avg)
+# colnames(fpkm_avg)[-1]<-paste0(colnames(fpkm_avg)[-1],"_fpkm_avg")
+# 
+# fpkm_se <- fpkm_df %>% dplyr::select(id,condition,se) %>% pivot_wider(names_from = condition, values_from = se)
+# colnames(fpkm_se)[-1]<-paste0(colnames(fpkm_se)[-1],"_fpkm_se")
+# 
+# fpkm_avgse<-left_join(fpkm_avg,fpkm_se)
+# rownames(fpkm_avgse) <- fpkm_avgse$id
+
+#write_tsv(fpkm_table, "~/Desktop/YBX1_clip_fpkm.tsv")
+```
+
+## PCA (based on FPKM)
+
+```{r warning=F, message=F}
+#prcomp function computes the pca on the given data matrix
+data.PC <- prcomp(as.matrix(t(fpkm_table)), scale. = T)
+
+data.PC_df <- as.data.frame(data.PC$x[,1:2])
+data.PC_df$sample <- rownames(data.PC_df)
+data.PC_df <- left_join(data.PC_df, c_anno)
+
+summ <- summary(data.PC)
+summ$importance[2,]
+
+pca <- ggplot(data.PC_df, aes(PC1, PC2, colour = condition, shape = library)) + 
+  geom_point(size = 2.5, alpha = .9) +
+  geom_text_repel(aes(label = paste(library, cell, replicate, sep = "_")), size = 0.2*bs, fontface = "bold", show.legend = F) + #adds labels directly on the plot
+  scale_colour_manual(values = c("#5b5b5b","#bf9000","#0b5394","#cc0000")) +
+  theme_bw(base_size = bs, base_family = bf) +
+  ylab(paste0("PC2 (", round(summ$importance[2,2]*100), " %)")) +
+  xlab(paste0("PC1 (", round(summ$importance[2,1]*100), "%)")) +
+  theme(legend.position = "right", panel.grid.minor = element_blank())
+
+pca
+```
+
+```{r standard deviation plot, fig.width=10}
+
+sdev <- as.data.frame(data.PC$sdev)
+colnames(sdev) <- "sd"
+sdev$PC <- paste("PC", rownames(sdev), sep = "")
+
+var_explained <- (sdev$sd)^2/sum((sdev$sd)^2)
+sdev$var_expl <- var_explained
+levels(sdev$PC) <- unique(sdev$PC)
+
+sdev_plot <- ggplot(sdev, aes(PC, sd)) +
+  geom_bar(stat = "identity", width = 0.7, fill ="#43bccd", color = "#43bccd") +
+  theme_bw(base_size = bs, base_family = bf) +
+  theme(axis.title.y=element_blank(),panel.border=element_blank(),axis.text.y = element_text(size=8, colour = "black")) +
+  theme(panel.grid.major.y = element_blank(),panel.grid.minor.x = element_blank())+
+  theme(legend.position = "na") + 
+  labs(title = "Standard deviation plot", x = NULL, y = " (%)") +
+  scale_x_discrete(limits=sdev$PC)
+
+# percentage of variance explained
+scree_plot <- fviz_screeplot(data.PC)
+
+sdev_plot + scree_plot
+```
+
+## MDS plot based on FPKM values
+
+```{r mds_fpkm}
+
+sample_data <- scale(t(fpkm_table))
+sample_distances <- dist(sample_data, method = "euclidean")
+
+mds_cmdscale <- as.data.frame(cmdscale(as.matrix(sample_distances)))
+colnames(mds_cmdscale) <- c("MDS_1", "MDS_2")
+mds_cmdscale$sample <- rownames(mds_cmdscale)
+
+mds_cmdscale <- left_join(mds_cmdscale, c_anno)
+
+cmd <- ggplot(mds_cmdscale, aes(MDS_1, MDS_2, colour = condition, shape = library)) +
+  geom_point(size = 2.5, alpha =.9) +
+  geom_text_repel(aes(label = paste(library, cell, replicate, sep = "_")), size = 0.2*bs, fontface = "bold", show.legend = F) +
+  scale_color_manual(values = c("#5b5b5b","#bf9000","#0b5394","#cc0000")) +
+  theme_bw(base_size = bs, base_family = bf) +
+  theme(legend.position = "right", panel.grid.minor = element_blank())
+
+cmd
+```
+
+## Differentially bound regions (DE peaks)
+
+```{r design}
+
+design <- model.matrix(~0+condition, data = edge_c$samples) # create a binary matrix to pair replicates (description of the conditions)
+colnames(design) <- levels(edge_c$samples$condition)
+
+edge_d <- estimateDisp(edge_n, design, robust = T) # robust = TRUE to have a better estimation of the outliers
+
+edge_f <- glmQLFit(edge_d, design, robust = T) #squeeze of the variances -> estimation of the quasi-likelihood (QL) dispersions around
+
+design
+```
+
+```{r}
+edgeRglmQLF_2022 <- function(glmfit, # object of class DGEGLM
+                      contrast_chr, # comparison (string)
+                      comp_name="", # include in label column
+                      signal_col="CPM", # signal column
+                      signal_thr=0.1, # signal threshold
+                      fc_col="log2_FC",
+                      fc_thr=0.5, # fold change threshold
+                      pval_col="p_val", # p-value column
+                      pval_thr=0.05) # p-value threshold
+                      { 
+  
+  contro<-makeContrasts(contrasts=contrast_chr,levels=glmfit$design)
+  
+  degs<-glmQLFTest(glmfit,
+                   contrast= contro)$table[,c("logFC","PValue")]
+  colnames(degs)<-c("log2_FC","p_val")
+  
+  degs$id<-rownames(degs)
+  degs$comp<-ifelse(comp_name!="",comp_name,contrast_chr)
+  degs$p_adj<-p.adjust(degs$p_val, method ="BH")
+  
+  active_levels<-rownames(contro)[which(contro!=0)]
+  active_samples<-which(glmfit$samples$group%in%active_levels)
+  cpm_sele<-cpm(glmfit,log=F)[,active_samples]
+  
+  degs$CPM<-round(rowMeans(cpm_sele),3)
+  #degs$CPM<-round(2^degs_u$log2_CPM,3)
+  
+  degs$class<-"="
+  degs[which(degs[,signal_col]>=signal_thr & 
+             degs[,fc_col]>=fc_thr & 
+             degs[,pval_col]<=pval_thr),"class"]<-"+"
+
+  degs[which(degs[,signal_col]>=signal_thr &
+             degs[,fc_col]<=(-fc_thr) &
+             degs[,pval_col]<=pval_thr),"class"]<-"-"
+  
+  degs<-degs %>% dplyr::select(id,comp,class,log2_FC,p_val,p_adj,CPM)
+
+  return(degs)
+}
+
+```
+
+
+```{r}
+# extract results
+degs_w_df <- NULL
+degs_l_df <- NULL
+
+contro_list<-list(#"IP_enr"="((IP_SCC+IP_HK)/2-(Input_SCC+Input_HK)/2)",
+                  "SCC_enr"="IP_SCC-Input_SCC",
+                  "HK_enr"="IP_HK-Input_HK",
+                  "SCC_HK_IP"="IP_SCC-IP_HK",
+                  "SCC_HK_Input"="Input_SCC-Input_HK",
+                  "SCC_HK_dd"="(IP_SCC-IP_HK)-(Input_SCC-Input_HK)")
+
+for(contro_label in names(contro_list)){
+  
+  degs_u <- edgeRglmQLF_2022(glmfit = edge_f,
+                             contrast_chr = contro_list[[contro_label]],
+                             comp_name = contro_label,
+                             signal_col = "CPM", signal_thr = -Inf,
+                             fc_col = "log2_FC", fc_thr = 1,
+                             pval_col = "p_val", pval_thr = 0.05)
+  
+  degs_l_df <- bind_rows(degs_l_df, degs_u)
+  rownames(degs_l_df) <- NULL
+  
+  degs_add <- degs_u |> dplyr::select("class", "log2_FC", "p_val", "p_adj", "CPM")
+  colnames(degs_add) <- paste(degs_u[1, "comp"], colnames(degs_add), sep = "_")
+  degs_w_df <- bind_cols(degs_w_df, degs_add)
+  
+  }
+
+degs_w_df <- bind_cols(r_anno, degs_w_df) #whole dataframe of differentially bound regions + region annotations
+degs_l_df$comp <- factor(degs_l_df$comp, levels = c( "SCC_HK_dd","SCC_HK_Input","SCC_HK_IP","SCC_enr","HK_enr")) # long dataframe of differentially bound regions
+```
+
+```{r summary of the number of differentially bound peaks}
+#degs_l_df <- read_tsv("results/DEGs_l_df.tsv")
+#degs_w_df <- read_tsv("results/DEGs_w_df.tsv")
+
+degs_l_df |> dplyr::group_by(comp, class) |> summarise("number" = n()) |> filter(class != "=")
+```
+
+```{r plotting function}
+plot_DEGs<-function(degs_df, # dataframe containing DEGs result
+                    contrast_col="comp", # Name of the column with contrast names
+                    class_col="class", # Name of the column with classes (+,-,= are expected)
+                    color_vec=c("grey35","grey65") # Colors for Up and Down regulated
+                     ){
+  res_mat<-degs_df %>% group_by(get(contrast_col),get(class_col),.drop=FALSE) %>% summarise("number"=n()) %>% ungroup() 
+  # get() to return the value of variable 
+  # in this way we can assign the name of the column to a variable and keep the same script changing every time only the name of the column
+  # .drop=FALSE to keep the comparisons with zero-value classes (for example in the fdr df)
+  colnames(res_mat)<-c("contrast","class","number")
+  res_df<-res_mat %>% filter(class!="=")
+  
+  res_df$class<-factor(res_df$class,levels=c("+","-"))
+  res_df$contrast<-as.factor(res_df$contrast)
+  res_df$number<-as.numeric(res_df$number)
+  res_df$number[which(res_df$class=="-")]<-res_df$number[which(res_df$class=="-")]*(-1) 
+  # *(-1) to assign to the total number of down-reg a - sign and put them on the left of the plot
+  
+  bs<-11
+  bap<-ggplot(res_df,aes(x=contrast,y=number,fill=class)) +
+    scale_fill_manual(name="",values=color_vec,labels=c("Up", "Down"))+
+    geom_bar(stat="identity",position=position_nudge(),width=0.7,alpha=0.9) +
+    geom_text(aes(x=contrast, y=number, label=abs(number), hjust=ifelse(number>=0,1.1,-0.1)), colour="white",size=bs*0.3,fontface="plain") +
+    theme_tufte(base_size = bs,base_family="Arial") +
+    theme(axis.title.y=element_blank()) +
+    theme(panel.border=element_blank()) +
+    theme(axis.ticks=element_blank()) +
+    theme(panel.grid=element_blank()) +
+    geom_hline(yintercept=0,col="grey30",lty=1,lwd=0.03*bs)+
+    theme(axis.text.y=element_text(colour="grey20")) +
+    theme(axis.text.x=element_blank()) +
+    theme(legend.position="none") +
+    #theme(legend.justification=c(1.05,1.05), legend.position=c(1,0.07)) +
+    theme(legend.title=element_blank())+
+    coord_flip()+
+    annotate("text", x=Inf, y=0, label = "Up",hjust=(-0.3),vjust=(1),colour=color_vec[1])+
+    annotate("text", x=Inf, y=0, label = "Down",hjust=(1.3),vjust=(1),colour=color_vec[2])+
+    theme(legend.text = element_text(size = 0.8*bs),
+          legend.key.size = unit((0.012*bs),"in"))+
+    labs(y="Number of DEGs")
+  
+  return(bap)
+}
+```
+
+
+```{r plot of DE peaks}
+
+in_bp <- degs_l_df |> filter((comp == "SCC_HK_IP" | comp == "SCC_enr" | comp == "HK_enr"))
+
+in_bp <- in_bp[-which(in_bp$comp == "SCC_enr" & in_bp$class == "-"),]
+in_bp <- in_bp[-which(in_bp$comp == "HK_enr" & in_bp$class == "-"),]
+
+pDEGs<-plot_DEGs(in_bp,
+          contrast_col="comp", 
+          color_vec=c("#cc0000","#0b5394"),
+          class_col="class")
+
+pDEGs
+```
+
+In the plot we have the number of differentially bound regions. The peaks enriched in the HK are 31948 while those enriched in the SCC are 33399.
+
+```{r}
+degs_cand <- degs_w_df |> dplyr::filter((SCC_enr_class == "+" | HK_enr_class == "+")) # filter to have in the df only SCC or HK enriched peaks
+
+fc_col <- "SCC_HK_IP_log2_FC" 
+pval_col <- "SCC_HK_IP_p_val"
+
+fc_thr <- 0.75
+pval_thr <- 0.05
+
+degs_cand$eclip_class <- "common"
+degs_cand[which(degs_cand[,fc_col] >= fc_thr & degs_cand[,pval_col]<= pval_thr), "eclip_class"] <- "SCC_gain" 
+degs_cand[which(degs_cand[,fc_col] <= (-fc_thr) & degs_cand[,pval_col]<= pval_thr), "eclip_class"] <- "HK_gain"
+
+fc_col <- "SCC_HK_dd_log2_FC"
+
+degs_cand$eclip_cor_class <- degs_cand$eclip_class
+degs_cand[which(degs_cand[,"eclip_class"] == "SCC_gain" & degs_cand[,fc_col] >= fc_thr), "eclip_cor_class"] <- "SCC_gain_delta"
+degs_cand[which(degs_cand[,"eclip_class"] == "HK_gain" & degs_cand[,fc_col] <= (-fc_thr)), "eclip_cor_class"] <- "HK_gain_delta"
+
+
+table(degs_cand$eclip_class)
+
+#write_tsv(degs_cand, file = "./DEGs_cand.tsv")
+```
+
+## Volcano plots
+
+```{r}
+in_df <- degs_cand
+in_df$HK_enr_eclip_class <- ifelse(in_df$HK_enr_class == "+", TRUE, FALSE)
+in_df$SCC_enr_eclip_class <- ifelse(in_df$SCC_enr_class == "+", TRUE, FALSE)
+
+ggplot(in_df, aes(x = SCC_enr_log2_FC, y = -log(SCC_enr_p_val), color = SCC_enr_eclip_class)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values = c("grey50","#b51416")) +
+  theme_bw() +
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  labs(color = "Enriched") 
+
+#ggsave("./results/SCC_enr_volcano.png", device = "png", width = 6, height = 5)
+
+ggplot(in_df, aes(x = HK_enr_log2_FC, y = -log(HK_enr_p_val), color = HK_enr_eclip_class)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values = c("grey50","#240ba2")) +
+  theme_bw() +
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  labs(color = "Enriched") 
+
+#ggsave("./results/HK_enr_volcano.png", device = "png", width = 6, height = 5)
+```
+
+## Number of peaks
+
+```{r number of peaks plot}
+peaks_plot_df <- degs_cand |> group_by(eclip_cor_class) |> summarise(peaks = n()) |> ungroup()
+
+peaks_plot <- ggplot(peaks_plot_df) +
+  theme_bw(base_family = "Arial", base_size = bs) +
+  #facet_wrap(vars(region_class), ncol = 1) +
+  xlab("") + ylab("Peaks (N)") +
+  #ggtitle("Peaks numbers") +
+  theme(plot.title = element_text(hjust = 0.5)) + guides(fill = guide_legend(title = "class")) +
+  theme(axis.title.y = element_blank(), panel.border = element_blank()) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())+
+  geom_col(aes(x= eclip_cor_class, y = peaks, fill = eclip_cor_class), width = .5, alpha = .9, position = "dodge") + 
+  scale_fill_manual(values=c("grey65","#6c56da","#240ba2","#eb5e60","#b51416")) +
+  geom_text_repel(aes( x = eclip_cor_class, y = peaks, label = peaks, vjust = 0.5, hjust = 0, family = "bf"), segment.color = NA, color = "white") +
+  theme(legend.position = "none") +
+  coord_flip()
+
+peaks_plot
+```
+
+## Region analysis
+
+```{r}
+region_df <- degs_cand |> 
+  filter(eclip_class != "common") |>
+  group_by(region_class, eclip_class) |> 
+  summarise(peaks = n()) |> 
+  ungroup() |> 
+  group_by(eclip_class) |>
+  mutate(tot_peaks = sum(peaks)) |>
+  ungroup() |>
+  mutate(peak_perc = round((peaks/tot_peaks)*100, 2))
+
+region_df$region_class <- factor(region_df$region_class, levels = c("3_UTR", "CDS", "5_UTR", "Exon", "Intron", "Intergenic"))
+
+ggplot(region_df, aes(x = region_class, y = peak_perc, fill = eclip_class)) + 
+  geom_bar(stat = "identity") + 
+  theme_tufte(base_size = bs, base_family = bf) + 
+  facet_wrap(~eclip_class) + 
+  coord_flip() +
+  scale_fill_manual(values = rev(c("#ae68ff","#40ab7c"))) +
+  theme(legend.position = "none", axis.title.y = element_blank()) +
+  labs(y = "% peaks") +
+  #labs(y = "Number m5Cs") +
+  geom_text(aes(label = paste(round(peak_perc,1), "%"), hjust = ifelse(region_df$region_class %in% c("3_UTR", "CDS"),1,-0.1)))
+
+#write.xlsx(region_df |> dplyr::select(region_class,eclip_class,peak_perc), file = "~/Desktop/Projects/YBX1_giorgia/eClip/peaks_localization.xlsx")
+```
+
+## Scatterplot
+
+```{r}
+scatter_enr_df <- degs_w_df
+scatter_enr_df$overall_enr_class <- FALSE
+scatter_enr_df$overall_enr_class[which(scatter_enr_df$SCC_enr_class == "+")] <- TRUE
+scatter_enr_df$overall_enr_class[which(scatter_enr_df$HK_enr_class == "+")] <- TRUE
+
+in_bp <- scatter_enr_df |> dplyr::select(HK_enr_log2_FC, SCC_enr_log2_FC, overall_enr_class)
+
+ggplot(scatter_enr_df, aes(x = HK_enr_log2_FC, y = SCC_enr_log2_FC, color = overall_enr_class, order = as.numeric(overall_enr_class))) +
+  geom_point() +
+  theme_bw() +
+  scale_colour_manual(values=rev(c("#a6a6a6","grey30"))) +
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  labs(color = "Enriched")
+```
+
+
+```{r}
+scatter_plot <- ggplot(degs_cand, aes(SCC_HK_Input_log2_FC, SCC_HK_IP_log2_FC, colour = eclip_cor_class)) +
+  geom_point(size = 1, alpha =.5, shape = 16) +
+  theme_bw(base_size = bs, base_family = bf) +
+  geom_vline(xintercept = 0, color = "grey50", lty = 2) +
+  geom_hline(yintercept = 0, color = "grey50", lty = 2) +
+  scale_colour_manual(values=c("grey65","#6c56da","#240ba2","#eb5e60","#b51416"))
+
+scatter_plot
+```
+
+```{r}
+volcano_bp <- degs_cand |> dplyr::select(SCC_HK_IP_log2_FC, SCC_HK_IP_p_val, eclip_class)
+table(volcano_bp$eclip_class)
+
+ggplot(volcano_bp, aes(x = SCC_HK_IP_log2_FC, y = -log10(SCC_HK_IP_p_val), color = eclip_class)) +
+  geom_point() + 
+  theme_bw(base_size = bs, base_family = bf) +
+  #scale_y_log10()
+  scale_colour_manual(values=c("grey65","#240ba2","#b51416")) +
+  labs(color = "Class")
+```
+
+
+## Letterfrequency
+
+```{r, echo=F, eval=T, warning=F, message=F}
+load("~/Desktop/anno/ense_RData/enst_seq.RData")
+
+letter_content_df <- enst2 |> dplyr::filter(canonical == "T") |> dplyr::select(external_gene_name, `5utr`, coding,`3utr`)
+letter_content_df <- letter_content_df |> dplyr::filter(`5utr` != "Sequence unavailable", `5utr` != "Sequence unavailable", `3utr` != "Sequence unavailable")
+letter_content_df <- letter_content_df |> pivot_longer(cols = 2:4, names_to = "region", values_to = "sequence")
+letter_content_df$sequence <- letter_content_df$sequence |> str_replace_all("T", "U")
+letter_content_df <- left_join(degs_cand |> dplyr::select(external_gene_name, eclip_class), letter_content_df)
+
+in_df<- letter_content_df
+freq_df<-NULL
+
+for(e_class in unique(in_df$eclip_class)){
+  for(r_class in c("3utr","coding")){
+  sub_df <- in_df %>% dplyr::filter(eclip_class==e_class & region==r_class)
+  sub_rna <- RNAStringSet(sub_df$sequence)
+  sub_freq_df<-as.data.frame(alphabetFrequency(sub_rna, baseOnly=TRUE, collapse=TRUE, as.prob=T)[1:4])
+  colnames(sub_freq_df)<-"prob"
+  sub_freq_df$nucleotide<-rownames(sub_freq_df)
+  sub_freq_df$perc<-sub_freq_df$prob*100
+  sub_freq_df$eclip_class<-e_class
+  sub_freq_df$region_class<-r_class
+  freq_df<- rbind(freq_df,sub_freq_df)
+  }
+}
+
+bp<-ggplot(freq_df,aes(nucleotide,perc,fill=nucleotide))+
+  geom_bar(stat="identity")+
+  theme_bw() +
+  scale_fill_manual(values = ACGU_color)+
+  scale_y_continuous(breaks=c(0,25,50,75,100))+
+  #facet_wrap(vars(eclip_cor_class,region_class), nrow=2) +
+  facet_grid(vars(region_class),vars(eclip_class)) +
+  ylab('Percentage (%)') + 
+  #ggtitle('Nucleotide composition') + 
+  theme(plot.title = element_text(hjust=0.5))+
+  theme(axis.text.x = element_text(colour=ACGU_color))+
+  theme(panel.grid.minor.y=element_blank(),panel.grid.major.x=element_blank()) + 
+  theme(legend.position="none")
+bp
+
+transcripts_freq_df <- freq_df
+#ggsave("~/Desktop/eCLIP_final_figures/transcripts_nucleotide_composition.pdf", device = cairo_pdf, width = 4, height = 3)
+```
+
+
+```{r, echo=F, eval=T, warning=F, message=F}
+in_df<- degs_cand
+freq_df<-NULL
+
+for(e_class in unique(in_df$eclip_class)){
+  for(r_class in c("CDS","3_UTR")){
+  sub_df <- in_df %>% dplyr::filter(eclip_class==e_class,region_class==r_class)
+  sub_rna <- RNAStringSet(sub_df$peak_seq)
+  sub_freq_df<-as.data.frame(alphabetFrequency(sub_rna, baseOnly=TRUE, collapse=TRUE, as.prob=T)[1:4])
+  colnames(sub_freq_df)<-"prob"
+  sub_freq_df$nucleotide<-rownames(sub_freq_df)
+  sub_freq_df$perc<-sub_freq_df$prob*100
+  sub_freq_df$eclip_class<-e_class
+  sub_freq_df$region_class<-r_class
+  freq_df<- rbind(freq_df,sub_freq_df)
+  }
+}
+
+bp<-ggplot(freq_df,aes(nucleotide,perc,fill=nucleotide))+
+  geom_bar(stat="identity")+
+  theme_bw() +
+  scale_fill_manual(values = ACGU_color)+
+  scale_y_continuous(breaks=c(0,25,50,75,100))+
+  #facet_wrap(vars(eclip_cor_class,region_class), nrow=2) +
+  facet_grid(vars(region_class),vars(eclip_class)) +
+  ylab('Percentage (%)') + 
+  #ggtitle('Nucleotide composition') + 
+  theme(plot.title = element_text(hjust=0.5))+
+  theme(axis.text.x = element_text(colour=ACGU_color))+
+  theme(panel.grid.minor.y=element_blank(),panel.grid.major.x=element_blank()) + 
+  theme(legend.position="none")
+bp
+
+#ggsave("~/Desktop/eCLIP_final_figures/peaks_nucleotide_composition.pdf", device = cairo_pdf, width = 4, height = 3)
+```
+
+```{r}
+## moving sand computation
+sand_df <- freq_df |> mutate(group = paste(region_class, nucleotide, sep = "_"))
+sand_transcripts_df <- transcripts_freq_df |> mutate(group = paste(region_class, nucleotide, sep = "_"))
+
+sand_df <- pivot_wider(sand_df[,-c(1,5)], names_from = eclip_class, values_from = perc, names_prefix = "p_")
+sand_transcripts_df <- pivot_wider(sand_transcripts_df[,-c(1,5)], names_from = eclip_class, values_from = perc, names_prefix = "t_")
+
+sand_transcripts_df$group <- c("3_UTR_A", "3_UTR_C", "3_UTR_G", "3_UTR_U", "CDS_A", "CDS_C", "CDS_G", "CDS_U")
+
+f_df <- merge(x = sand_df, y = sand_transcripts_df)
+```
+
+### PCA based on letter frequency
+```{r}
+## DO NOT RUN if you want to keep the percentages of 3utr and cds separated
+## join CDS and 3UTR percentages
+f_df <- f_df %>%
+  group_by(nucleotide) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE))
+rownames(f_df) <- f_df$nucleotide
+
+data.PC <- prcomp(as.matrix(t(f_df[,-c(1)])), scale. = T)
+data.PC_df <- as.data.frame(data.PC$x[,1:2])
+data.PC_df$sample <- rownames(data.PC_df)
+data.PC_df$type <- ifelse(str_detect(data.PC_df$sample, "t"), "Whole Transcript", "YBX1 Binding Region")
+
+#rownames(f_df) <- f_df$group
+#data.PC <- prcomp(as.matrix(t(f_df[,-c(1,2)])), scale. = T)
+#data.PC_df <- as.data.frame(data.PC$x[,1:2])
+#data.PC_df$sample <- rownames(data.PC_df)
+
+##data.PC_df <- left_join(data.PC_df, c_anno)
+
+rownames(data.PC$rotation) <- rownames(f_df)
+loadings <- as.data.frame(data.PC$rotation[,1:2]) ## extract the loadings
+#arrows <- eigenval * sqrt(data.PC$sdev[1:2]) #compute the arrows
+
+# Compute a scaling factor
+scale_factor <- min(
+  (max(data.PC_df$PC1) - min(data.PC_df$PC1)) / (max(loadings$PC1) - min(loadings$PC1)),
+  (max(data.PC_df$PC2) - min(data.PC_df$PC2)) / (max(loadings$PC2) - min(loadings$PC2))
+)
+
+loadings_scaled <- loadings * scale_factor* 0.7 #is just to shrink arrows a bit
+loadings_scaled$varname <- rownames(loadings_scaled)
+loadings_scaled$letter <- paste("%",str_split_i(loadings_scaled$varname, "_", i = -1))
+
+## percentages of var explained by each PCs
+summ <- summary(data.PC)
+summ$importance[2,]
+
+data.PC_df$sample <- rep(c("SCC", "Common", "HK"),2)
+data.PC_df$type <- factor(data.PC_df$type, levels = c("YBX1 Binding Region", "Whole Transcript"))
+
+
+pca <- ggplot(data.PC_df, aes(PC1, PC2, color = sample)) + 
+  geom_point(aes(shape = type),size = 2.5, alpha = .9) +
+  geom_text_repel(aes(label = sample), size = 0.3*bs, fontface = "bold", show.legend = F) + #adds labels directly on the plot
+
+  theme_bw(base_size = bs, base_family = bf) +
+  scale_shape_manual(values = c(17,15)) +
+  theme(legend.position = "right", panel.grid.minor = element_blank()) +
+  ylab(paste("PC2 (", round(summ$importance[2,2]*100), " %)")) +
+  xlab(paste("PC1 (", round(summ$importance[2,1]*100), "%)")) +
+  theme(legend.position = "top") + 
+  geom_hline(yintercept = 0, linetype = 2) + 
+  geom_vline(xintercept = 0, linetype = 2) + 
+  geom_segment(data = loadings_scaled,
+               aes(x = 0, y = 0, xend = PC1, yend = PC2, colour = letter),
+               arrow = arrow(length = unit(0.2, "cm")), alpha = .9) + 
+  geom_text_repel(data=loadings_scaled, aes(x = PC1,y = PC2,label=letter, colour = letter), inherit.aes = F, vjust = -1, hjust = 0.5, size = 0.3*bs, fontface = "bold") +
+  scale_colour_manual(values = c("% A" = ACGU_color[1], "% C" = ACGU_color[2], "% G" = ACGU_color[3], "% U" = ACGU_color[4],
+                                 "Common"="#a6a6a6","HK"="#40ab7c","SCC"="#ae68ff")) +
+  guides(colour = "none") + 
+  labs(shape = "Sequence type")
+  #guides(shape = "T")
+  
+pca
+```
+
+## Metaprofile
+
+```{r}
+load("./data/ens_anno_110_hs.RData")
+load("./data/enst_seq.RData")
+
+enst_slim <- enst |> 
+  dplyr::filter(canonical == "T" & !l_5utr == 0 & !l_cds == 0 & !l_3utr == 0 & transcript_biotype == "protein_coding") |>
+  mutate(perc_5utr = (l_5utr/transcript_length)*100,
+         perc_cds = (l_cds/transcript_length)*100,
+         perc_3utr = (l_3utr/transcript_length)*100, .by = "ensembl_transcript_id") |>
+  #mutate(mean_perc_5utr = round(mean(perc_5utr)),
+  #       mean_perc_cds = round(mean(perc_cds)),
+  #       mean_perc_3utr =  round(mean(perc_3utr))) |>
+  mutate(tx_5utr_start = 1,
+         tx_5utr_end = (tx_5utr_start + (l_5utr))) |>
+  mutate(tx_cds_start = tx_5utr_end+1,
+         tx_cds_end = (tx_5utr_end + (l_cds))) |>
+  mutate(tx_3utr_start = tx_cds_end + 1,
+         tx_3utr_end = (tx_cds_end + (l_3utr)))
+
+ense_slim <- ense |> dplyr::filter(ensembl_transcript_id %in% enst_slim$ensembl_transcript_id)
+
+anno_df_slim <- enst_slim |> dplyr::select(ensembl_gene_id,ensembl_transcript_id,l_5utr,l_cds,l_3utr,tx_5utr_start,tx_5utr_end,tx_cds_start,tx_cds_end,tx_3utr_start,tx_3utr_end)
+anno_df_slim <- left_join(anno_df_slim, ense |> dplyr::select(ensembl_transcript_id, ensembl_exon_id)) |> dplyr::relocate(ensembl_exon_id, .after = ensembl_transcript_id)
+anno_df_slim <- left_join(anno_df_slim, ensg |> dplyr::select(ensembl_gene_id,external_gene_name))
+```
+
+
+```{r}
+load("./data/eCLIP_data/genome2transcript/HK_gain_peaks/HK_gain_peaks_coord_tx_df.RData")
+load("./data/eCLIP_data/genome2transcript/SCC_gain_peaks/SCC_gain_peaks_coord_tx_df.RData")
+load("./data/eCLIP_data/genome2transcript/Common_peaks/Common_peaks_coord_tx_df.RData")
+
+clip_peaks_coord_tx_df <- rbind(HK_gain_peaks_coord_tx_df, SCC_gain_peaks_coord_tx_df)
+clip_peaks_coord_tx_df <- rbind(clip_peaks_coord_tx_df, Common_peaks_coord_tx_df)
+
+clip_peaks_coord_tx_df <- clip_peaks_coord_tx_df |>
+  dplyr::rename("ensembl_transcript_id" = "tx_id", "ensembl_exon_id" = "exon_id") |>
+  dplyr::select(id_name,start,end,ensembl_transcript_id,ensembl_exon_id,exon_rank,seq_strand,
+                width,length,peak_seq,external_gene_name,region_class,eclip_class) |>
+  dplyr::mutate(crosslink_position = start+round(width/2))
+  #dplyr::rename("zero-based_position" = "start", "strand" = "seq_strand") |> 
+  #dplyr::mutate("one-based_position" = `zero-based_position`+1) |>
+  #dplyr::relocate(`one-based_position`, .after = `zero-based_position`)
+```
+
+```{r}
+source("~/Desktop/Github_repo/Metaprofiles_functions/transcript_metaprofile.R")
+
+eclip_met2 <- create_metaprofile(df = clip_peaks_coord_tx_df |>
+                     dplyr::filter(!eclip_class == "common"), anno_df = anno_df_slim, split_by = "eclip_class", pos_df_cols = c(transcript_id = "ensembl_transcript_id",
+                        pos = "crosslink_position",
+                        count = "id_name"),total_bins = 50, percentages = T, smooth = T, group_colors =c("common" = "#a6a6a6", 
+                                                                                                         "SCC_gain" = "#ae68ff","HK_gain" = "#40ab7c"))
+
+eclip_met2$metaprofile_plot
+
+length(unique(eclip_met2$input_anno_df$external_gene_name)) #3013 transcripts
+```
+
