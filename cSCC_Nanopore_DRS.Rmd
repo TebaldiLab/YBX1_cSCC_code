@@ -1,0 +1,1168 @@
+---
+title: "cSCC_Nanopore_DRS"
+output: html_document
+date: "2026-01-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(echo = TRUE, root.dir = '~/Desktop/cSCC_Nanopore_script_data/')
+```
+
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(xlsx2dfs)
+library(GenomicRanges)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggpubr)
+library(ggbeeswarm)
+library(ggthemes)
+library(ggrepel)
+library(ggbreak)
+library(edgeR)
+library(SummarizedExperiment)
+
+library(extrafont) # plots with arial font (and cairo_pdf device)
+loadfonts()
+bs <- 11
+bf <- "Arial"
+```
+
+```{r}
+colors_list <- c("common" = "#a6a6a6","SCC" = "#ae68ff", "HK" = "#40ab7c", "UV" = "#C93465")
+
+colors_DMS_list_2 <- c("common" = "#a6a6a6", "SCC_up" = "#ae68ff", "SCC_down" = "#cea4ff",
+                       "HK_up" = "#40ab7c","HK_down" = "#8cccb0",
+                       "UV_up" = "#C93465", "UV_down" = "#de85a2")
+```
+
+## Sample Loading
+
+The modification_counts and coverage matrices were built from the output Bedmethyl files with a custom bash script. Filtering was performed with an additional R script exploiting two functions to perform coverage filtering and subsequent modification filtering.
+
+In this case we upload matrices filtered to retain: 
+- reads \> 10 in 3 replicates of all the three conditions 
+- modification \> 1 in \>= 2 replicates on \>= 1 condition
+
+```{r}
+#load("/data/giorgia/YBX1/Nanopore/Dorado_v1_SUP_pileup/all_merged/merged/RData/Raw_tables.RData")
+
+m5C_mod_filtered_df <- fread("./data/Nanopore_data/m_mod_filtered_mod_table.txt")
+m5C_cov_filtered_df <- fread("./data/Nanopore_data/m_mod_filtered_coverage_table.txt")
+
+
+m5C_r_anno <- m5C_mod_filtered_df |> dplyr::select(site_id, chrom,start,end,strand,type) |> dplyr::rename("id" = "site_id")
+
+m5C_mod_filtered_df <- m5C_mod_filtered_df[,c(1,7:15)]
+m5C_mod_filtered_df <- m5C_mod_filtered_df |> dplyr::rename("id"= site_id,
+                                                            "UV_1" = FBonc_1_DoradoV1_pileup,
+                                                            "UV_2" = FBonc_2_DoradoV1_pileup,
+                                                            "UV_3" = FBonc_3_DoradoV1_pileup,
+                                                            "HK_1" = P549_Sample1_DoradoV1_merged,
+                                                            "HK_2" = P549_Sample2_DoradoV1_merged,
+                                                            "HK_3" = P549_Sample3_DoradoV1_merged,
+                                                            "SCC_1" = P549_Sample4_DoradoV1_merged,
+                                                            "SCC_2" = P549_Sample5_DoradoV1_merged,
+                                                            "SCC_3" = P549_Sample6_DoradoV1_merged)
+
+m5C_cov_filtered_df <- m5C_cov_filtered_df[,c(1,7:15)]
+m5C_cov_filtered_df <- m5C_cov_filtered_df |> dplyr::rename("id"= site_id,
+                                                            "UV_1" = FBonc_1_DoradoV1_pileup,
+                                                            "UV_2" = FBonc_2_DoradoV1_pileup,
+                                                            "UV_3" = FBonc_3_DoradoV1_pileup,
+                                                            "HK_1" = P549_Sample1_DoradoV1_merged,
+                                                            "HK_2" = P549_Sample2_DoradoV1_merged,
+                                                            "HK_3" = P549_Sample3_DoradoV1_merged,
+                                                            "SCC_1" = P549_Sample4_DoradoV1_merged,
+                                                            "SCC_2" = P549_Sample5_DoradoV1_merged,
+                                                            "SCC_3" = P549_Sample6_DoradoV1_merged)
+
+```
+
+```{r}
+c_anno <- data.frame("sample" = colnames(m5C_mod_filtered_df)[2:10])
+c_anno$condition <- str_split_i(c_anno$sample, "_", i = 1)
+```
+
+## Gene Annotation
+
+Intersect the modification sites with annotation info on genes.
+
+```{r}
+#load("~/rdds_shared/data/giorgia/YBX1/Nanopore/Analysis/Dorado_V1/Dorado_v1_SUP_filtered_modification.RData")
+load("./data/ens_anno_110_hs.RData")
+
+# creating exon and gene annotation
+ense_slim <- ense |> dplyr::select(ensembl_exon_id,
+                                   rank, 
+                                   exon_chrom_start,
+                                   '5_utr_start',
+                                   "5_utr_end",
+                                   genomic_coding_start,
+                                   genomic_coding_end,
+                                   "3_utr_start",
+                                   "3_utr_end",
+                                   exon_chrom_end,
+                                   l_exon,
+                                   l_5utr,
+                                   l_3utr,
+                                   l_cds,
+                                   TIS, TTS, exon_class,
+                                   ensembl_transcript_id) 
+
+
+# transcript annotation
+enst_slim <- enst |> dplyr::select(external_transcript_name,
+                                   transcript_biotype, transcript_length,
+                                   canonical, ensembl_transcript_id, ensembl_gene_id)
+
+rownames(enst_slim) <- enst_slim$ensembl_transcript_id
+enst_slim <- enst_slim[ense_slim$ensembl_transcript_id,]
+enst_slim$ensembl_transcript_id <- NULL
+
+# gene annotation
+ensg_slim <- ensg |> dplyr::select(external_gene_name, ensembl_gene_id, gene_biotype, chr_ucsc, strand_ucsc)
+rownames(ensg_slim) <- ensg_slim$ensembl_gene_id
+ensg_slim <- ensg_slim[enst_slim$ensembl_gene_id,]
+ensg_slim$ensembl_gene_id <- NULL
+
+# single annotation 
+ense_df <- cbind(ense_slim, enst_slim, ensg_slim) #combines all the annotation dataframes into one
+# in rownames we have the gene names
+rownames(ense_df)<-make.unique(str_c(ense_df$external_transcript_name, ense_df$rank, sep="_")) #combines external transcript name and rank with "_"
+
+
+# the following function takes a dataframe-like object as input and tries to automatically find the columns that describe genomic ranges
+# returns a GRanges object
+ense_granges <- makeGRangesFromDataFrame(ense_df,
+                                         keep.extra.columns = T, 
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr_ucsc", 
+                                         start.field = "exon_chrom_start",  
+                                         end.field = "exon_chrom_end", 
+                                         strand.field = "strand_ucsc",
+                                         starts.in.df.are.0based = F)
+
+ensg_df <- ensg |> dplyr::select(external_gene_name, ensembl_gene_id, gene_biotype, chr_ucsc, strand_ucsc, start_position, end_position, description)
+
+ensg_granges <- makeGRangesFromDataFrame(ensg_df,
+                                         keep.extra.columns = T, 
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr_ucsc", 
+                                         start.field = "start_position",  
+                                         end.field = "end_position", 
+                                         strand.field = "strand_ucsc",
+                                         starts.in.df.are.0based = F)
+
+```
+
+```{r}
+m5C_r_anno$start <- as.numeric(m5C_r_anno$start)
+m5C_r_anno$end <- as.numeric(m5C_r_anno$end)
+
+chr_conversion_canonical <- data.frame(
+   "chr_ens"=c("1","2","3","4","5","6","7","8","9","10",
+      "11","12","13","14","15","16","17","18","19","20",
+      "21","22","X","Y","MT"),
+   "chr_ucsc"=c("chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9","chr10",
+      "chr11","chr12","chr13","chr14","chr15","chr16","chr17","chr18","chr19","chr20",
+      "chr21","chr22","chrX","chrY","chrM"))
+
+m5C_r_anno <- m5C_r_anno |> dplyr::filter(chrom %in% chr_conversion_canonical$chr_ucsc) #keep only the canonical chromosomes
+
+# check for peak width
+mod_base_granges <- makeGRangesFromDataFrame(m5C_r_anno,
+                                         keep.extra.columns = F,
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chrom",
+                                         start.field = "start",
+                                         end.field = "end",
+                                         strand.field = "strand",
+                                         starts.in.df.are.0based = T)
+
+m5C_r_anno$peak_seq <- getSeq(BSgenome.Hsapiens.UCSC.hg38, mod_base_granges) |> as.character() |> stringr::str_replace_all("T", "U")
+
+m5C_r_anno <- m5C_r_anno[!(str_detect(m5C_r_anno$peak_seq, "N")),] #remove sequences with N
+
+mod_base_granges <- makeGRangesFromDataFrame(m5C_r_anno,
+                                         keep.extra.columns = T,
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chrom",
+                                         start.field = "start",
+                                         end.field = "end",
+                                         strand.field = "strand",
+                                         starts.in.df.are.0based = T)
+```
+
+```{r}
+## Annotation on genes to find intergenic regions and distinguish them from those spanning genes
+
+over_genes<- GenomicRanges::findOverlaps(mod_base_granges, ensg_granges) #this function returns the overlap (n.rows) between peaks and genes
+
+## identifies the overlaps
+genes_overlaps_ranges <- pintersect(mod_base_granges[queryHits(over_genes)], ensg_granges[subjectHits(over_genes)])
+
+mod_base_2_ensg <- mod_base_granges[queryHits(over_genes)] %>% as_tibble() %>% 
+  dplyr::select(-width)
+ensg_2_mod_base<- ensg_granges[subjectHits(over_genes)] %>% as_tibble() %>%
+  dplyr::rename(gene_chrom_start=start,
+                gene_chrom_end=end,
+                gene_width=width) %>% 
+  dplyr::select(-seqnames,-strand)
+
+mod_ensg_df <-bind_cols(mod_base_2_ensg,ensg_2_mod_base) 
+
+mod_ensg_df$region_class <- "Intron"
+mod_ensg_df$gene_biotype<-factor(mod_ensg_df$gene_biotype)
+mod_ensg_df$gene_biotype<-relevel(mod_ensg_df$gene_biotype, ref = "protein_coding")
+
+mod_ensg_dt<- as.data.table(mod_ensg_df)
+setkey(mod_ensg_dt,gene_biotype,gene_width,external_gene_name)
+mod_ensg_dt<-mod_ensg_dt[order(gene_biotype,gene_width,external_gene_name)]
+mod_ensg_unique <- mod_ensg_dt[!duplicated(id)]
+```
+
+```{r}
+m5C_r_anno$region_class <- "Intergenic"
+m5C_r_anno$region_class[which(m5C_r_anno$id %in% mod_ensg_unique$id)] <- "Intron"
+```
+
+```{r}
+rm(over_genes,genes_overlaps_ranges,mod_base_2_ensg,ensg_2_mod_base, mod_ensg_df,mod_ensg_dt)
+#gc()
+```
+
+```{r}
+## Annotation of peaks over exonic regions (still no details about 5', CDS, 3')
+over_exons <- GenomicRanges::findOverlaps(mod_base_granges, ense_granges)
+
+
+exons_overlaps_ranges <- pintersect(mod_base_granges[queryHits(over_exons)], ense_granges[subjectHits(over_exons)])
+
+mod_base_2_ense <- mod_base_granges[queryHits(over_exons)] %>% as_tibble() %>% 
+  dplyr::select(-width)
+ense_2_mod_base<- ense_granges[subjectHits(over_exons)] %>% as_tibble() %>%
+  dplyr::rename(exon_chrom_start=start,
+                exon_chrom_end=end,
+                exon_width=width) %>% 
+  dplyr::select(-seqnames,-strand)
+
+mod_ense_df <-bind_cols(mod_base_2_ense,ense_2_mod_base) 
+#mod_ense_df$overlap_width <- exons_overlap_widths
+#peak_ensg_df <- peak_ensg_df %>% dplyr::filter(!(id_name %in% peak_ense_add$id_name))
+
+mod_ense_df$region_class <- "Exon"
+mod_ense_df$gene_biotype<-factor(mod_ense_df$gene_biotype)
+mod_ense_df$gene_biotype<-relevel(mod_ense_df$gene_biotype, ref = "protein_coding")
+
+mod_ense_dt<- as.data.table(mod_ense_df)
+setkey(mod_ense_dt,gene_biotype,exon_width,external_gene_name)
+mod_ense_dt<-mod_ense_dt[order(gene_biotype,exon_width,external_gene_name)]
+mod_ense_unique <- mod_ense_dt[!duplicated(id)]
+
+m5C_r_anno$region_class[which(m5C_r_anno$id %in% mod_ense_unique$id)] <- "Non-coding Exon"
+
+## Add annotations of the exons 
+
+mod_anno_ense_eng <- full_join(mod_ense_unique, mod_ensg_unique)
+mod_anno_ense_ensg_dt<- as.data.table(mod_anno_ense_eng)
+setkey(mod_anno_ense_ensg_dt,gene_biotype,exon_width,external_gene_name)
+mod_anno_ense_ensg_dt<-mod_anno_ense_ensg_dt[order(gene_biotype,exon_width,external_gene_name)]
+mod_anno_ense_ensg_unique <- mod_anno_ense_ensg_dt[!duplicated(id)]
+```
+
+```{r}
+rm(over_exons,exons_overlaps_ranges,mod_base_2_ense,ense_2_mod_base,mod_ense_df,mod_ense_dt,mod_anno_ense_eng,mod_anno_ense_ensg_dt)
+#gc()
+```
+
+```{r}
+m5C_r_anno <- left_join(m5C_r_anno, mod_anno_ense_ensg_unique |> dplyr::select(id, external_gene_name))
+
+table(m5C_r_anno$region_class)
+```
+
+### Transcript Region Annotation
+
+```{r}
+## 5' UTR granges
+ense_5_utr_granges <- makeGRangesFromDataFrame(ense_df |> dplyr::filter(!is.na(l_5utr)),
+                                               keep.extra.columns = T,
+                                               ignore.strand = F,
+                                               seqinfo = NULL,
+                                               seqnames.field = "chr_ucsc",
+                                               start.field = "5_utr_start",
+                                               end.field = "5_utr_end",
+                                               strand.field = "strand_ucsc",
+                                               starts.in.df.are.0based = F)
+
+
+
+## CDS granges
+ense_cds_granges <- makeGRangesFromDataFrame(ense_df |> dplyr::filter(!is.na(l_cds)),
+                                               keep.extra.columns = T,
+                                               ignore.strand = F,
+                                               seqinfo = NULL,
+                                               seqnames.field = "chr_ucsc",
+                                               start.field = "genomic_coding_start",
+                                               end.field = "genomic_coding_end",
+                                               strand.field = "strand_ucsc",
+                                               starts.in.df.are.0based = F)
+
+## 3' UTR granges
+ense_3_utr_granges <- makeGRangesFromDataFrame(ense_df |> dplyr::filter(!is.na(l_3utr)),
+                                               keep.extra.columns = T,
+                                               ignore.strand = F,
+                                               seqinfo = NULL,
+                                               seqnames.field = "chr_ucsc",
+                                               start.field = "3_utr_start",
+                                               end.field = "3_utr_end",
+                                               strand.field = "strand_ucsc",
+                                               starts.in.df.are.0based = F)
+
+```
+
+```{r over 5'utr}
+over_5_utr <- GenomicRanges::findOverlaps(mod_base_granges, ense_5_utr_granges) ## overlap between peaks and 5'UTR
+
+overlap_ranges_5utr <- pintersect(mod_base_granges[queryHits(over_5_utr)], ense_5_utr_granges[subjectHits(over_5_utr)])
+#overlap_widths_5utr <- width(overlap_ranges_5utr)
+
+mod_base_2_5utr <- mod_base_granges[queryHits(over_5_utr)] |> as.tibble() #|> dplyr::rename(_width = width)
+ense_5utr_2_mod_base <- ense_5_utr_granges[subjectHits(over_5_utr)] |> as.tibble() |> dplyr::select(-width, -seqnames, -strand) |> dplyr::rename(start_5_utr = start, end_5_utr = end)
+
+mod_base_5utr_df <- bind_cols(mod_base_2_5utr, ense_5utr_2_mod_base)
+#mod_base_5utr_df$overlap_width <- overlap_widths_5utr
+mod_base_5utr_df$region_class <- "5_UTR"
+
+mod_base_5utr_dt<- as.data.table(mod_base_5utr_df)
+setkey(mod_base_5utr_dt, canonical, region_class, external_transcript_name, rank)
+mod_base_5utr_dt<-mod_base_5utr_dt[order(canonical,exon_class,external_transcript_name,rank)]
+mod_base_5utr_unique <- mod_base_5utr_dt[!duplicated(id)]
+
+m5C_r_anno$region_class[which(m5C_r_anno$id %in% mod_base_5utr_unique$id)] <- "5_UTR"
+```
+
+```{r}
+rm(over_5_utr, overlap_ranges_5utr, mod_base_2_5utr,ense_5utr_2_mod_base,mod_base_5utr_df,mod_base_5utr_dt)
+#gc()
+```
+
+```{r}
+over_cds <- GenomicRanges::findOverlaps(mod_base_granges, ense_cds_granges) ## overlap between peaks and 5'UTR
+
+overlap_ranges_cds <- pintersect(mod_base_granges[queryHits(over_cds)], ense_cds_granges[subjectHits(over_cds)])
+#overlap_widths_5utr <- width(overlap_ranges_5utr)
+
+mod_base_2_cds <- mod_base_granges[queryHits(over_cds)] |> as.tibble() #|> dplyr::rename(_width = width)
+ense_cds_2_mod_base <- ense_cds_granges[subjectHits(over_cds)] |> as.tibble() |> dplyr::select(-width, -seqnames, -strand) |> dplyr::rename(start_cds = start, end_cds = end)
+
+mod_base_cds_df <- bind_cols(mod_base_2_cds, ense_cds_2_mod_base)
+#mod_base_5utr_df$overlap_width <- overlap_widths_5utr
+mod_base_cds_df$region_class <- "CDS"
+
+mod_base_cds_dt<- as.data.table(mod_base_cds_df)
+setkey(mod_base_cds_dt, canonical, region_class, external_transcript_name, rank)
+mod_base_cds_dt<-mod_base_cds_dt[order(canonical,exon_class,external_transcript_name,rank)]
+mod_base_cds_unique <- mod_base_cds_dt[!duplicated(id)]
+
+m5C_r_anno$region_class[which(m5C_r_anno$id %in% mod_base_cds_unique$id)] <- "CDS"
+```
+
+```{r}
+rm(over_cds, overlap_ranges_cds, mod_base_2_cds,ense_cds_2_mod_base,mod_base_cds_df,mod_base_cds_dt)
+#gc()
+```
+
+```{r over 3'utr}
+over_3_utr <- GenomicRanges::findOverlaps(mod_base_granges, ense_3_utr_granges) ## overlap between peaks and 5'UTR
+
+overlap_ranges_3utr <- pintersect(mod_base_granges[queryHits(over_3_utr)], ense_3_utr_granges[subjectHits(over_3_utr)])
+#overlap_widths_5utr <- width(overlap_ranges_5utr)
+
+mod_base_2_3utr <- mod_base_granges[queryHits(over_3_utr)] |> as.tibble() #|> dplyr::rename(_width = width)
+ense_3utr_2_mod_base <- ense_3_utr_granges[subjectHits(over_3_utr)] |> as.tibble() |> dplyr::select(-width, -seqnames, -strand) |> dplyr::rename(start_3_utr = start, end_3_utr = end)
+
+mod_base_3utr_df <- bind_cols(mod_base_2_3utr, ense_3utr_2_mod_base)
+#mod_base_5utr_df$overlap_width <- overlap_widths_5utr
+mod_base_3utr_df$region_class <- "3_UTR"
+
+mod_base_3utr_dt<- as.data.table(mod_base_3utr_df)
+setkey(mod_base_3utr_dt, canonical, region_class, external_transcript_name, rank)
+mod_base_3utr_dt<-mod_base_3utr_dt[order(canonical,exon_class,external_transcript_name,rank)]
+mod_base_3utr_unique <- mod_base_3utr_dt[!duplicated(id)]
+
+m5C_r_anno$region_class[which(m5C_r_anno$id %in% mod_base_3utr_unique$id)] <- "3_UTR"
+```
+
+```{r}
+rm(over_3_utr, overlap_ranges_3utr, mod_base_2_3utr,ense_3utr_2_mod_base,mod_base_3utr_df,mod_base_3utr_dt)
+#gc()
+```
+
+```{r}
+table(m5C_r_anno$region_class)
+```
+
+## Proportion table construction
+
+```{r}
+calculate_methylation_frequency <- function(
+    cov_table, 
+    mod_table, 
+    condition_map
+) {
+  
+  message("-------------------------------------------------------")
+  message("Calculating Methylation Proportions (Beta Values)...")
+  
+  # 1. Identify Sample Columns
+  samples <- unlist(condition_map)
+  
+  # Check consistency
+  if (!all(samples %in% names(cov_table)) || !all(samples %in% names(mod_table))) {
+    stop("Error: Sample columns do not match input tables.")
+  }
+  
+  # 2. Initialize the Ratio Table with Metadata
+  # Copy metadata columns (first 5 usually: site_id, chrom, start, end, strand)
+  meta_cols <- setdiff(names(cov_table), samples)
+  dt_beta <- cov_table[, ..meta_cols]
+  
+  # 3. Perform Vectorized Division (Mod / Cov)
+  # data.table allows math on whole sub-matrices at once!
+  
+  # We convert to matrix for speed, divide, then assign back
+  mat_cov <- as.matrix(cov_table[, ..samples])
+  mat_mod <- as.matrix(mod_table[, ..samples])
+  
+  # Calculate Ratio (0 to 1 scale)
+  # Note: 0/0 will produce NaN (which is correct for 'No Coverage')
+  mat_beta <- mat_mod / mat_cov
+  
+  # Optional: Round to 2 decimal places to save RAM/disk space
+  mat_beta <- round(mat_beta, 2)
+  
+  # 4. Attach columns back to the table
+  # We use (samples) := ... to assign columns in-place
+  dt_beta[, (samples) := as.data.table(mat_beta)]
+  
+  message("Done. Returns table with values 0.0 - 1.0")
+  message("Note: NaN values indicate 0 coverage (missing data).")
+  
+  return(dt_beta)
+}
+```
+
+```{r compute proportion table}
+rownames(m5C_cov_filtered_df) <- m5C_cov_filtered_df$id
+
+m5C_proportion_table <- calculate_methylation_frequency(cov_table = m5C_cov_filtered_df[,-1],
+                                                        mod_table = m5C_mod_filtered_df[,-1],
+                                                        condition_map = list("UV" = c("UV_1", "UV_2", "UV_3"),
+                                                                             "HK" = c("HK_1", "HK_2", "HK_3"),
+                                                                             "SCC" = c("SCC_1", "SCC_2", "SCC_3")))
+rownames(m5C_proportion_table) <- m5C_mod_filtered_df$id
+m5C_proportion_table$id <- rownames(m5C_proportion_table)
+```
+
+### Filtered proportion table
+
+We filter the sites with at least 1% or methylated sites in two replicates of one condition.
+
+```{r}
+m5C_prop_filt_001 <- m5C_proportion_table %>%
+  dplyr::filter(
+    (rowSums(dplyr::select(., starts_with("UV")) > 0.01) >= 2) |
+    (rowSums(dplyr::select(., starts_with("HK")) > 0.01) >= 2) |
+    (rowSums(dplyr::select(., starts_with("SCC")) > 0.01) >= 2)
+  )
+m5C_prop_filt_001$id <- rownames(m5C_prop_filt_001)
+
+m5C_cov_filt_001 <- m5C_cov_filtered_df |> dplyr::filter(id %in% m5C_prop_filt_001$id)
+m5C_mod_filt_001 <- m5C_mod_filtered_df |> dplyr::filter(id %in% m5C_prop_filt_001$id)
+
+m5C_r_anno_filt001 <- m5C_r_anno |> dplyr::filter(id %in% m5C_mod_filt_001$id)
+```
+
+## Differential Modification Analysis
+
+```{r}
+library(RNAEventProfiler)
+
+m5C_SE_obj <- RNAEventProfiler::generate_SE_object(event_counts = m5C_mod_filt_001[,-"id"], total_counts = m5C_cov_filt_001[,-"id"], colData = c_anno, rowInfo = m5C_r_anno_filt001)
+```
+
+```{r}
+my_contrasts <- list("SCC" = "SCC-HK")
+
+LRT_m5C_SE_obj_DE <- run_differential_analysis(se = m5C_SE_obj, condition = "condition", contrasts = my_contrasts, method = "LRT", norm_method = "TMM", stat_type = "PValue", p_threshold = 0.05, lfc_threshold = 0, delta_threshold = 0.01, use_coverage_offset = FALSE)
+
+m5C_DE_LRT <- as.data.frame(LRT_m5C_SE_obj_DE@rowRanges@elementMetadata)
+table(m5C_DE_LRT$SCC_Class)
+
+## Progressive definition
+m5C_DE_LRT <- m5C_DE_LRT |>
+  dplyr::mutate(
+    progressive_up = case_when(
+    Mean_HK <= Mean_UV  & Mean_HK < Mean_SCC & Mean_UV <= Mean_SCC ~ TRUE),
+    
+    progressive_down = case_when(
+    Mean_HK > Mean_SCC & Mean_HK >= Mean_UV & Mean_UV >= Mean_SCC ~ TRUE
+  ))
+
+m5C_DE_LRT$progressive_up[which(is.na(m5C_DE_LRT$progressive_up))] <- FALSE
+m5C_DE_LRT$progressive_down[which(is.na(m5C_DE_LRT$progressive_down))] <- FALSE
+
+## Class definition
+m5C_DE_LRT$plot_class <- "Equally_methylated"
+m5C_DE_LRT$plot_class[which(m5C_DE_LRT$progressive_up == T & 
+                                   m5C_DE_LRT$SCC_Class == "+")] <- "SCC_up"
+
+m5C_DE_LRT$plot_class[which(m5C_DE_LRT$progressive_down == T & 
+                                   m5C_DE_LRT$SCC_Class == "-")] <- "HK_up"
+
+table(m5C_DE_LRT$plot_class)
+
+mcols(LRT_m5C_SE_obj_DE) <- m5C_DE_LRT
+```
+
+## Fig.1I - Progressives representation
+
+```{r}
+prop_l <- m5C_DE_LRT |> 
+  dplyr::filter(!is.na(plot_class)) |>
+  dplyr::select(id,Mean_HK,Mean_UV,Mean_SCC) |>
+  pivot_longer(cols = 2:4, names_to = "sample", values_to = "mean_proportion")
+
+prop_l$condition <- str_split_i(prop_l$sample, "_", i=2)
+
+
+z_score_df <- prop_l |>
+  mutate(Z_score = as.numeric(scale(mean_proportion)), .by = id) |> 
+  mutate(Z_score= replace_na(Z_score,0))  
+
+z_score_df <- left_join(z_score_df, m5C_DE_LRT |> dplyr::select(id,progressive_down,progressive_up))  
+
+z_score_df <- z_score_df |>
+  dplyr::mutate(progressive_class = case_when(
+    progressive_up == T & progressive_down == F ~ "up",
+    progressive_up == F & progressive_down == T ~ "down",
+    progressive_up == F & progressive_down == F ~ "none"
+  ))
+
+z_score_df$condition <- factor(z_score_df$condition, levels = c("HK", "UV", "SCC"))
+z_score_df$progressive_class <- factor(z_score_df$progressive_class, levels = c("none", "down", "up"))
+```
+
+```{r fig.height=5, fig.width=10}
+ggplot(z_score_df |> dplyr::filter(progressive_class %in% c("down", "up")), aes(x = condition, y = Z_score, fill = progressive_class, colour = progressive_class)) + 
+  geom_line(aes(group = id), linewidth =1, alpha = 0.1) + 
+  geom_boxplot(color = "black", alpha = 0.8, width = 0.1, outlier.shape = 19) + 
+  scale_fill_manual(values = c("#40ab7c", "#ae68ff")) +
+  scale_color_manual(values = c("#8cccb0", "#cea4ff")) +
+  stat_summary(fun = median, geom = "line", aes(group = 1), color = "grey20",linewidth = 0.8) +
+  
+  # 4. Optional: Add points at the medians to make the exact values pop
+  stat_summary(fun = median, geom = "point", aes(group = 1), 
+               color = "black", size = 2) +
+  #geom_smooth(aes(group = 1), method = "lm", color = "black", linewidth = 1.2, se = TRUE) +
+  facet_wrap(~progressive_class, labeller = labeller(progressive_class = c("down" = "Progressive Down", "up" = "Progressive Up"))) + 
+  theme_bw(base_family = bf, base_size = 13) + 
+  theme(panel.grid.minor.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_blank(), legend.position = "none") + 
+  labs(y = "Z-Score")
+
+#ggsave("./REP/Paper_Figures_2/Progressive_sites_zscore.pdf", device = cairo_pdf, width = 5, height = 3)
+```
+## Fig.1L - Transcript localization plot
+
+```{r plot_region_localization function definition}
+plot_region_localization <- function(
+    data, 
+    id_col = "id", 
+    region_col = "region_class", 
+    group_cols = c("SCC_combined_class", "UV_combined_class", "HK_combined_class"),
+    filter_pattern = "_up",
+    region_levels = c("3_UTR", "CDS", "5_UTR", "Non-coding Exon", "Intron", "Intergenic"),
+    class_levels = c("HK_up", "UV_up", "SCC_up"),
+    inside_bar_levels = c("3_UTR", "CDS"),
+    fill_colors = NULL, 
+    base_size = 12, 
+    base_family = "sans"
+) {
+  
+  # 1. Data Manipulation
+  in_bp <- data |> 
+    dplyr::select(dplyr::all_of(c(id_col, region_col, group_cols))) |> 
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(group_cols), 
+      names_to = "comp", 
+      values_to = "class"
+    ) |> 
+    dplyr::filter(stringr::str_detect(class, filter_pattern)) |> 
+    dplyr::summarise(
+      N_m5C_per_region = dplyr::n_distinct(.data[[id_col]]), 
+      .by = dplyr::all_of(c("comp", "class", region_col))
+    ) |> 
+    dplyr::mutate(
+      tot = sum(N_m5C_per_region), 
+      .by = "class"
+    ) |> 
+    dplyr::mutate(
+      perc = (N_m5C_per_region / tot) * 100,
+      # Pre-calculate hjust to avoid messy subsetting inside ggplot
+      label_hjust = ifelse(.data[[region_col]] %in% inside_bar_levels, 1, -0.1),
+      .by = "class"
+    )
+  
+  # 2. Factoring
+  in_bp[[region_col]] <- factor(in_bp[[region_col]], levels = region_levels)
+  in_bp[["class"]] <- factor(in_bp[["class"]], levels = class_levels)
+  in_bp[["comp"]] <- factor(in_bp[["comp"]], levels = group_cols)
+  
+  # 3. Plotting
+  p <- ggplot2::ggplot(in_bp, ggplot2::aes(x = .data[[region_col]], y = perc, fill = class)) + 
+    ggplot2::geom_bar(stat = "identity") +
+    ggplot2::facet_wrap(~class) +
+    ggthemes::theme_tufte(base_size = base_size, base_family = base_family) +
+    ggplot2::coord_flip() +
+    ggplot2::theme(legend.position = "none", axis.title.y = ggplot2::element_blank()) +
+    ggplot2::labs(y = "% m5Cs") +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(round(perc, 1), "%"), hjust = label_hjust))
+  
+  # Conditionally apply custom colors if provided
+  if (!is.null(fill_colors)) {
+    p <- p + ggplot2::scale_fill_manual(values = fill_colors)
+  }
+  
+  return(p)
+}
+```
+
+```{r}
+plot_region_localization(data = m5C_DE_LRT, group_cols = c("plot_class"), fill_colors = colors_DMS_list_2)
+```
+
+## Fig.1M - Metaprofile function
+
+```{r map genome coordinates to transcriptome}
+load("~/Desktop/anno/ense_RData/ens_anno_110_hs.RData")
+
+in_gr <-  m5C_DE_LRT|> dplyr::rename("site_id" = "id")
+m5C_gr <- makeGRangesFromDataFrame(df = in_gr, keep.extra.columns = T,ignore.strand = F,seqnames.field = "chr", start.field = "start", end.field = "end", strand.field = "strand", starts.in.df.are.0based = T)
+names(m5C_gr) <- m5C_gr$site_id
+
+m5C_gx2tx <- RNAEventProfiler::map_to_transcriptome(x = m5C_gr, ense = ense, enst = enst, ensg = ensg)
+m5C_tx <- as.data.frame(m5C_gx2tx)
+```
+
+```{r}
+## adding information on lengths of transcript regions
+m5C_tx <- left_join(m5C_tx, enst |> dplyr::select(ensembl_transcript_id, l_5utr, l_cds,l_3utr), by = "ensembl_transcript_id")
+m5C_tx <- m5C_tx |> dplyr::filter(peak_seq == "C")
+```
+
+```{r create annotation file}
+enst_slim <- enst |> 
+  dplyr::filter(canonical == "T" & !l_5utr == 0 & !l_cds == 0 & !l_3utr == 0 & transcript_biotype == "protein_coding") |>
+  mutate(tx_5utr_start = 1,
+         tx_5utr_end = (tx_5utr_start + (l_5utr))) |>
+  mutate(tx_cds_start = tx_5utr_end+1,
+         tx_cds_end = (tx_5utr_end + (l_cds))) |>
+  mutate(tx_3utr_start = tx_cds_end + 1,
+         tx_3utr_end = (tx_cds_end + (l_3utr)))
+
+ense_slim <- ense |> dplyr::filter(ensembl_transcript_id %in% enst_slim$ensembl_transcript_id)
+
+anno_df_slim <- enst_slim |> dplyr::select(ensembl_gene_id,ensembl_transcript_id,l_5utr,l_cds,l_3utr,tx_5utr_start,tx_5utr_end,tx_cds_start,tx_cds_end,tx_3utr_start,tx_3utr_end)
+anno_df_slim <- left_join(anno_df_slim, ense |> dplyr::select(ensembl_transcript_id))
+anno_df_slim <- left_join(anno_df_slim, ensg |> dplyr::select(ensembl_gene_id,external_gene_name)) |> unique()
+```
+
+```{r create metaprofile}
+source("~/Desktop/Github_repo/Metaprofiles_functions/transcript_metaprofile.R")
+
+in_met <- m5C_tx |>
+  dplyr::select(site_id,ensembl_transcript_id,tx_start,plot_class) |>
+  pivot_longer(c("plot_class"), names_to = "comp", values_to = "class") |>
+  dplyr::filter(str_detect(class, "_up"))
+
+p <- create_metaprofile(df = in_met, anno_df = anno_df_slim, pos_df_cols = c(transcript_id="ensembl_transcript_id", pos = "tx_start", count = "site_id"), total_bins = 50, split_by = "class", percentages = T, group_colors = colors_DMS_list_2, smooth = T)
+
+p$metaprofile_plot
+```
+
+```{r filter sites in metaprofile}
+met_df <- p$input_anno_df
+
+scc_met_id <- met_df |> dplyr::filter(class == "SCC_up") |> pull(site_id)
+HK_met_id <- met_df |> dplyr::filter(class == "HK_up") |> pull(site_id)
+met_ids <- met_df$site_id
+```
+
+## Fig.1K - Binned barplot of stoichiometry
+
+```{r}
+plot_methylation_bins <- function(
+    prop_data, 
+    anno_data, 
+    ranno_data,
+    group_cols = c("SCC_combined_class", "UV_combined_class", "HK_combined_class"),
+    target_pattern = "SCC", 
+    exclude_class = "Equally_methylated",
+    fill_colors = NULL,
+    y_breaks = c(10, 100, 1000, 10000, 100000)
+) {
+  
+  # 1. Reshape and join proportions with annotations
+  m5C_prop_l_df <- prop_data |> 
+    tidyr::pivot_longer(cols = -id, names_to = "sample", values_to = "proportion") |>
+    dplyr::left_join(anno_data, by = "sample") # Assuming 'sample' is the key in c_anno
+  
+  # 2. Calculate mean proportions
+  m5C_mean_prop <- m5C_prop_l_df |> 
+    dplyr::group_by(id, condition) |> 
+    dplyr::summarise(mean_prop = mean(proportion, na.rm = TRUE), .groups = "drop")
+  
+  # 3. Create bins efficiently using cut()
+  # include.lowest = TRUE ensures 0 is included in the first bin [0, 0.1]
+  bin_labels <- c("0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5", 
+                  "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1")
+  
+  m5C_mean_prop <- m5C_mean_prop |>
+    dplyr::mutate(
+      bin = cut(mean_prop, breaks = seq(0, 1, by = 0.1), 
+                include.lowest = TRUE, labels = bin_labels)
+    ) |>
+    dplyr::left_join(
+      ranno_data |> dplyr::select(id, dplyr::all_of(group_cols)), 
+      by = "id"
+    )
+  
+  # 4. Filter, pivot, and count sites
+  in_bp <- m5C_mean_prop |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(group_cols), 
+      names_to = "comp", 
+      values_to = "class"
+    ) |>
+    dplyr::mutate(filter_class = stringr::str_split_i(class, "_", i = 1)) |>
+    dplyr::filter(condition == filter_class & !is.na(bin)) |> 
+    dplyr::select(-condition) |> 
+    dplyr::distinct() |> 
+    dplyr::filter(stringr::str_detect(class, target_pattern) & class != exclude_class) |> 
+    dplyr::group_by(class, bin) |> 
+    dplyr::summarise(N = dplyr::n_distinct(id), .groups = "drop")
+  
+  # 5. Plotting
+  p <- ggplot2::ggplot(in_bp, ggplot2::aes(x = bin, y = N, fill = class)) +
+    ggplot2::geom_bar(stat = "identity", position = "dodge") + 
+    ggplot2::geom_text(
+      ggplot2::aes(label = N), 
+      angle = 90, 
+      hjust = -0.2, # Changed to push text slightly above the bar
+      color = "black", 
+      position = ggplot2::position_dodge(0.9)
+    ) +
+    ggplot2::theme_bw() + 
+    ggplot2::scale_y_log10(
+      breaks = y_breaks,
+      expand = ggplot2::expansion(mult = c(0, 0.2)) # Gives top padding instead of expand_limits
+    ) +
+    ggplot2::theme(
+      legend.position = "top",
+      legend.title = ggplot2::element_blank(),
+      panel.grid.minor.y = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(angle = 45, vjust = 1, hjust = 1) # Fixed angle alignment
+    ) +
+    ggplot2::labs(y = "log10(N)", x = "Mean Proportion Bin")
+  
+  if (!is.null(fill_colors)) {
+    p <- p + ggplot2::scale_fill_manual(values = fill_colors)
+  }
+  
+  return(p)
+}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+plot_combined_methylation_bins <- function(
+    prop_data, 
+    anno_data, 
+    ranno_data,
+    group_cols = c("SCC_combined_class", "UV_combined_class", "HK_combined_class"),
+    exclude_class = "Equally_methylated",
+    fill_colors = NULL,
+    y_breaks = c(10, 100, 1000, 10000, 100000)
+) {
+  
+  # 1. Reshape, Join, and Calculate Means
+  m5C_mean_prop <- prop_data |> 
+    tidyr::pivot_longer(cols = -id, names_to = "sample", values_to = "proportion") |>
+    dplyr::left_join(anno_data, by = "sample") |> 
+    dplyr::group_by(id, condition) |> 
+    dplyr::summarise(mean_prop = mean(proportion, na.rm = TRUE), .groups = "drop")
+  
+  # 2. Binning using cut() and formatting conditions
+  bin_labels <- c("0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5", 
+                  "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1")
+  
+  m5C_mean_prop <- m5C_mean_prop |>
+    dplyr::mutate(
+      bin = cut(mean_prop, breaks = seq(0, 1, by = 0.1), 
+                include.lowest = TRUE, labels = bin_labels),
+      condition = paste0(condition, "_up") # Align condition with class nomenclature
+    )
+  
+  # 3. Join annotations, Pivot, Filter, and Count
+  in_bp <- m5C_mean_prop |>
+    dplyr::left_join(
+      ranno_data |> dplyr::select(id, dplyr::all_of(group_cols)), 
+      by = "id"
+    ) |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(group_cols), 
+      names_to = "comp", 
+      values_to = "class"
+    ) |>
+    # Your clever filtering logic: keep rows where biological condition matches the classification
+    dplyr::filter(condition == class & !is.na(bin) & class != exclude_class) |> 
+    dplyr::group_by(class, bin) |> 
+    dplyr::summarise(N = dplyr::n_distinct(id), .groups = "drop")
+  
+  # 4. Plotting
+  p <- ggplot2::ggplot(in_bp, ggplot2::aes(x = bin, y = N, fill = class)) +
+    ggplot2::geom_bar(stat = "identity", position = "dodge") + 
+    ggplot2::geom_text(
+      ggplot2::aes(label = N), 
+      angle = 90, 
+      hjust = -0.2, # Shift text slightly above the bar to avoid overlap
+      color = "black", 
+      position = ggplot2::position_dodge(0.9),
+      size = 3.5
+    ) +
+    ggplot2::theme_bw() + 
+    ggplot2::scale_y_log10(
+      breaks = y_breaks,
+      expand = ggplot2::expansion(mult = c(0, 0.25)) # Give 25% headroom for text labels
+    ) +
+    ggplot2::theme(
+      legend.position = "top",
+      legend.title = ggplot2::element_blank(),
+      panel.grid.minor.y = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(angle = 45, vjust = 1, hjust = 1)
+    ) +
+    ggplot2::labs(y = "log10(N)", x = "Mean Proportion Bin")
+  
+  # Apply custom colors if provided
+  if (!is.null(fill_colors)) {
+    p <- p + ggplot2::scale_fill_manual(values = fill_colors)
+  }
+  
+  return(p)
+}
+```
+
+```{r}
+plot_combined_methylation_bins(prop_data = m5C_prop_filt_001, anno_data = c_anno, ranno_data = m5C_DE_LRT |> dplyr::filter(peak_seq == "C"), group_cols = c("plot_class") ,fill_colors = colors_DMS_list_2)
+```
+
+## Supp. 1C - Scatter Plot
+
+```{r}
+in_bp <- m5C_DE_LRT |> dplyr::filter(peak_seq == "C")
+in_bp$plot_class[which(is.na(in_bp$plot_class))] <- "Equally_methylated"
+in_bp$plot_class <- factor(in_bp$plot_class, levels = rev(c("SCC_up", "HK_up", "Equally_methylated")))
+in_bp <- in_bp |> dplyr::arrange(plot_class)
+
+ggplot(in_bp, aes(x = SCC_vs_HK_Delta, y = SCC_vs_HK_log2FC, color = plot_class)) + 
+  geom_point() + 
+  theme_bw() + 
+  scale_color_manual(values = colors_DMS_list_2) + 
+  geom_hline(yintercept = 0, colour = "grey",linetype = "dashed") + 
+  geom_vline(xintercept = 0.01,colour = "grey",linetype = 2) +
+  geom_vline(xintercept = -0.01,colour = "grey", linetype = 2) + 
+  theme(legend.position = "none")
+```
+
+## Supp.1D - PCA
+
+```{r}
+## cleaning up data from 0 variance sites
+in_data <- m5C_prop_filt_001[which(m5C_prop_filt_001$id %in% dms_sites),-10]
+#in_data <- m5C_prop_filt_001[,-10]
+row_var <- apply(in_data, 1, var)
+data_filt <- in_data[row_var > 0,]
+
+data.PC <- prcomp(as.matrix(t(data_filt)), scale. = T)
+
+data.PC_df <- as.data.frame(data.PC$x[,1:4])
+data.PC_df$sample <- rownames(data.PC_df)
+data.PC_df <- left_join(data.PC_df, c_anno)
+
+summ <- summary(data.PC)
+summ$importance[2,]
+
+pca <- ggplot(data.PC_df, aes(PC1, PC2, colour = condition)) + 
+  geom_point(size = 2.5, alpha = .9) +
+  geom_text_repel(aes(label = sample), size = 0.3*bs, fontface = "bold", show.legend = F) + #adds labels directly on the plot
+  scale_color_manual(values = colors_list) +
+  theme_bw(base_size = bs, base_family = bf) +
+  theme(legend.position = "right", panel.grid.minor = element_blank()) +
+  ylab(paste("PC2 (", round(summ$importance[2,2]*100), " %)")) +
+  xlab(paste("PC1 (", round(summ$importance[2,1]*100), "%)")) +
+  theme(legend.position = "none")
+
+pca
+```
+
+## Supp.1F - N m5C per gene
+
+```{r}
+in_bp <- m5C_DE_LRT |> 
+  dplyr::filter(peak_seq == "C") |> 
+  dplyr::select(id, external_gene_name, plot_class) |>
+  na.omit() #|>
+  #pivot_longer(plot_class,names_to = "comp", values_to = "class") 
+
+in_bp <- in_bp |>
+  summarise(N_m5C_per_gene = n_distinct(id), .by = c("external_gene_name","plot_class")) |> 
+  mutate(N_genes = length(unique(external_gene_name)), .by = c("plot_class","N_m5C_per_gene"))
+
+in_bp$N_m5C_plot <- in_bp$N_m5C_per_gene
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene >= 1 & in_bp$N_m5C_per_gene <= 5)] <- "1-5"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 5 & in_bp$N_m5C_per_gene <= 10)] <- "5-10"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 10 & in_bp$N_m5C_per_gene <= 15)] <- "10-15"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 15 & in_bp$N_m5C_per_gene <= 20)] <- "15-20"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 20 & in_bp$N_m5C_per_gene <= 25)] <- "20-25"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 25 & in_bp$N_m5C_per_gene <= 30)] <- "25-30"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 30 & in_bp$N_m5C_per_gene <= 35)] <- "30-35"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 35 & in_bp$N_m5C_per_gene <= 40)] <- "35-40"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 40 & in_bp$N_m5C_per_gene <= 45)] <- "40-45"
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 45 & in_bp$N_m5C_per_gene <= 50)] <- "45-50"
+
+in_bp$N_m5C_plot[which(in_bp$N_m5C_per_gene > 50)] <- ">50"
+in_bp$N_genes_plot <- in_bp$N_genes
+
+in_bp <- in_bp |> na.omit() |> group_by(plot_class,N_m5C_plot) |> mutate(N_genes_try = length(unique(external_gene_name)))
+
+in_bp$N_m5C_plot <- factor(in_bp$N_m5C_plot, levels = c("1-5", "5-10", "10-15", "15-20", "20-25",
+                                                        "25-30", "30-35", "35-40", "40-45", "45-50" ,">50"))
+
+in_plot <- in_bp |> dplyr::select(N_m5C_plot, N_genes_try,plot_class) |> unique()
+
+ggplot(in_plot, aes(x = N_m5C_plot, y = N_genes_try, fill = plot_class)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = N_genes_try), angle = 90, hjust = ifelse(in_plot$N_m5C_plot %in% c("1-5"),1,-0.2), color = "black", position = position_dodge(0.9)) +
+  scale_y_cut(breaks = 25, expand = F, scales = 0.5) +
+  scale_fill_manual(values = colors_DMS_list_2) +
+  labs(x = "Number m5Cs", y = "Number of genes") +
+  theme_bw() +
+  theme(legend.position = c("top"),
+        legend.title = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  #labs(title = "Number of m5Cs per transcript") +
+  expand_limits(y = 5000)
+```
+
+## Fig.2A - NSUN2 motif
+
+```{r}
+library(ggseqlogo)
+
+motif_gr <- makeGRangesFromDataFrame(m5C_DE_LRT,
+                                     keep.extra.columns = TRUE,
+                                     seqnames.field = "chr",
+                                     start.field = "start",
+                                     end.field = "end",
+                                     strand.field = "strand",
+                                     starts.in.df.are.0based = TRUE)
+
+motif_gr_resized <- promoters(motif_gr, upstream = 2, downstream = 8)
+
+m5C_DE_LRT$motif_seq <- getSeq(BSgenome.Hsapiens.UCSC.hg38, motif_gr_resized) |>
+  as.character() |>
+  str_replace_all("T", "U")
+```
+
+```{r}
+HK_motif_df <- m5C_DE_LRT |> dplyr::filter(plot_class == "HK_up" & id %in% HK_met_id & peak_seq == "C") |> dplyr::mutate(motif_seq = str_replace_all(motif_seq, "_", "-"))
+
+ggplot() + 
+  geom_logo(HK_motif_df$motif_seq, seq_type = "rna", method = "probability") + 
+  labs(title = "HK m5C", subtitle = paste("( N°", length(HK_motif_df$motif_seq), ")", sep = " ")) + 
+  theme_tufte(base_size = bs, base_family = bf)
+```
+
+```{r}
+SCC_motif_df <- m5C_DE_LRT |> dplyr::filter(plot_class == "SCC_up" & id %in% scc_met_id) |> dplyr::mutate(motif_seq = str_replace_all(motif_seq, "_", "-"))
+
+ggplot() + 
+  geom_logo(SCC_motif_df$motif_seq, seq_type = "rna", method = "probability") + 
+  labs(title = "SCC m5C", subtitle = paste("( N°", length(SCC_motif_df$motif_seq), ")", sep = " ")) + 
+  theme_tufte(base_size = bs, base_family = bf)
+```
+
+## Intersection with YBX1 binding regions
+
+```{r}
+degs_cand <- read_tsv("./data/eCLIP_data/YBX1_DEGs_cand.tsv")
+```
+
+```{r}
+peak_granges <- makeGRangesFromDataFrame(df = degs_cand,ignore.strand = F, start.field = "start", end.field = "end", strand.field = "strand", keep.extra.columns = T, seqnames.field = "chr")
+
+mod_base_granges <- makeGRangesFromDataFrame(m5C_DE_LRT,
+                                         keep.extra.columns = T,
+                                         ignore.strand = F,
+                                         seqinfo = NULL,
+                                         seqnames.field = "chr",
+                                         start.field = "start",
+                                         end.field = "end",
+                                         strand.field = "strand",
+                                         starts.in.df.are.0based = T)
+
+## Annotation on genes to find intergenic regions and distinguish them from those spanning genes
+over_eclip<- GenomicRanges::findOverlaps(mod_base_granges, peak_granges) #this function returns the overlap (n.rows) between peaks and genes
+
+mod_overlaps_peaks <- pintersect(mod_base_granges[queryHits(over_eclip)], peak_granges[subjectHits(over_eclip)])
+
+
+mod_base_2_clip <- mod_base_granges[queryHits(over_eclip)] %>% as_tibble() %>% 
+  dplyr::select(-width)
+clip_2_mod_base <- peak_granges[subjectHits(over_eclip)] %>% as_tibble() %>%
+  dplyr::rename(peak_chrom_start=start,
+                peak_chrom_end=end,
+                peak_width=width) %>% 
+  dplyr::select(-seqnames,-strand)
+
+mod_clip_df <-bind_cols(mod_base_2_clip,clip_2_mod_base) 
+
+
+mod_clip_df$clip_overlap <- TRUE
+
+m5C_DE_LRT$clip_overlap <- FALSE
+m5C_DE_LRT$clip_overlap[which(m5C_DE_LRT$id %in% mod_clip_df$id)] <- TRUE
+m5C_DE_LRT <- left_join(m5C_DE_LRT, mod_clip_df |> dplyr::select(id, id_name, eclip_class))
+```
+
+## Fig. 3H - Numbers overlapping m5C DMS and YBX1 DB peaks
+```{r}
+m5C_DE_LRT$plot_class[which(is.na(m5C_DE_LRT$plot_class))] <- "Equally_methylated"
+in_bp <- m5C_DE_LRT |> 
+  dplyr::filter(!is.na(eclip_class) & plot_class != "Equally_methylated" & id %in% met_ids) |>
+  summarise(N_m5C_in_CLIP = n_distinct(id), .by = c("plot_class")) |>
+  mutate(perc = N_m5C_in_CLIP/(sum(N_m5C_in_CLIP))*100)
+
+in_bp$x <- "m5C"
+
+ggplot(in_bp, 
+       aes(x = plot_class, y = N_m5C_in_CLIP, fill = plot_class)) + 
+  geom_bar(stat = "identity") + 
+  #scale_fill_manual(values = c("grey50", "#40ab7c", "#ae68ff")) + 
+  scale_fill_manual(values = c("#40ab7c", "#ae68ff")) + 
+  theme_tufte(base_size = bs, base_family = bf) + 
+  labs(y = "N m5C in YBX1 binding sites", fill = "m5C class") + 
+  theme(axis.title.x = element_blank()) + 
+  geom_text_repel(aes(label = N_m5C_in_CLIP), hjust=0.5, vjust=0)
+```
+## Fig.3I - m5C-YBX1 Metaprofile
+
+```{r}
+in_gr <-  m5C_DE_LRT|> dplyr::rename("site_id" = "id")
+m5C_gr <- makeGRangesFromDataFrame(df = in_gr, keep.extra.columns = T,ignore.strand = F,seqnames.field = "chr", start.field = "start", end.field = "end", strand.field = "strand", starts.in.df.are.0based = T)
+names(m5C_gr) <- m5C_gr$site_id
+
+m5C_gx2tx <- RNAEventProfiler::map_to_transcriptome(x = m5C_gr, ense = ense, enst = enst, ensg = ensg)
+m5C_tx <- as.data.frame(m5C_gx2tx)
+```
+
+```{r}
+## adding information on lengths of transcript regions
+m5C_tx <- left_join(m5C_tx, enst |> dplyr::select(ensembl_transcript_id, l_5utr, l_cds,l_3utr), by = "ensembl_transcript_id")
+m5C_tx <- m5C_tx |> dplyr::filter(peak_seq == "C")
+```
+
+```{r}
+in_met <- m5C_tx |>
+  dplyr::filter(!is.na(eclip_class)) |>
+  dplyr::select(site_id,ensembl_transcript_id,tx_start,plot_class) |>
+  pivot_longer(c("plot_class"), names_to = "comp", values_to = "class") |>
+  dplyr::filter(str_detect(class, "_up"))
+
+x <- create_metaprofile(df = in_met, anno_df = anno_df_slim, pos_df_cols = c(transcript_id="ensembl_transcript_id", pos = "tx_start", count = "site_id"), total_bins = 40, split_by = "class", percentages = T, group_colors = colors_DMS_list_2, smooth = T)
+x$metaprofile_plot
+
+#ggsave("./REP/Paper_Figures_2/YBX1_m5C_progressive_metaprofile_40bins_smoothed.pdf", device= cairo_pdf, width = 5, height = 4)
+```
+```{r}
+length(unique(x$input_anno_df$ensembl_transcript_id)) ## number of unique transcripts in the metaprofile
+```
+
+## Fig.3K-I
+
+```{r}
+library(rstatix)
+structure_res_df <- read.xlsx("./data/Nanopore_data/m5C_structure_output_2026.xlsx")
+
+summary <- structure_res_df[1:3,]
+
+colnames(structure_res_df) <- structure_res_df[4,]
+structure_res_df <- structure_res_df[5:198,-14]
+structure_res_df <- structure_res_df |> na.omit()
+structure_res_df$`Energy (kcal/mol)` <- as.numeric(structure_res_df$`Energy (kcal/mol)`)
+structure_res_df$`f(ssRNA)` <- as.numeric(structure_res_df$`f(ssRNA)`)
+structure_res_df$`f(dsRNA)` <- 1 - structure_res_df$`f(ssRNA)`
+
+targets <- c("NRP1", "NSD2", "FOXK1")
+
+## Fig. 3K
+p_val <- structure_res_df |>
+  wilcox_test(`Energy (kcal/mol)`~plot_class) |>
+  adjust_pvalue() |> 
+  add_significance("p") |> 
+  add_xy_position(x = "plot_class") 
+
+ggplot(structure_res_df, aes(x =plot_class, y = `Energy (kcal/mol)`, fill = plot_class, color = plot_class)) + 
+  geom_violin(alpha = 0.1) + 
+  geom_boxplot(notch = T, width = 0.2, fill = "white", outliers = T) +
+  scale_fill_manual(values = colors_DMS_list_2) + 
+  scale_color_manual(values = colors_DMS_list_2) +
+  theme_bw(base_family = bf, base_size = 15) + 
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) + 
+  stat_pvalue_manual(p_val, label = "p", step.increase = 0.01, hide.ns = T, inherit.aes = F) +
+  geom_text_repel(aes(label = ifelse(external_gene_name %in% targets, external_gene_name, "")),
+                  color = "black", max.overlaps = 10000000,min.segment.length = 0, vjust = 0.5, hjust = 0.5)
+
+## Fig. 3I
+p_val <- structure_res_df |>
+  wilcox_test(`f(dsRNA)`~plot_class) |>
+  adjust_pvalue() |> 
+  add_significance("p") |> 
+  add_xy_position(x = "plot_class") 
+
+ggplot(structure_res_df, aes(x =plot_class, y = `f(dsRNA)`, fill = plot_class, color = plot_class)) + 
+  geom_violin(alpha = 0.1) + 
+  geom_boxplot(notch = T, width = 0.2, fill = "white", outliers = T) +
+  scale_fill_manual(values = colors_DMS_list_2) + 
+  scale_color_manual(values = colors_DMS_list_2) +
+  theme_bw(base_family = bf, base_size = 15) + 
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) + 
+  stat_pvalue_manual(p_val, label = "p", step.increase = 0.01, hide.ns = T, inherit.aes = F) +
+  geom_text_repel(aes(label = ifelse(external_gene_name %in% targets, external_gene_name, "")),
+                  color = "black", max.overlaps = 10000000,min.segment.length = 0, vjust = 0.5, hjust = 0.5)
+```
+
